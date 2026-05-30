@@ -122,6 +122,11 @@ METRICS: dict[str, dict] = {
         "fmt": ".1f",
         "help": "Return on Opening Equity = net profit / equity at start of the year. More accurate than ROE for fast-growing firms because it measures return on the capital you actually deployed, not inflated by the same year's profit.",
     },
+    "ROTCD (%)": {
+        "col": "rotcd_pct",
+        "fmt": ".1f",
+        "help": "Return on Total Capital Deployed = net profit / opening (equity + related-party loans). Identical to ROOE for companies with no intercompany debt. More realistic for thinly-capitalised firms funded via shareholder loans — common for new ApS setups where the owner injects capital as a loan rather than formal equity.",
+    },
     "TRADE (%)": {
         "col": "trade_pct",
         "fmt": ".1f",
@@ -142,7 +147,7 @@ METRICS: dict[str, dict] = {
 # Grouped order for dropdowns — entries starting with "──" are visual separators
 _METRIC_ORDER = [
     "── Returns ──",
-    "ROE (%)", "ROOE (%)", "TRADE (%)", "ROCE (%)", "ROA (%)",
+    "ROE (%)", "ROOE (%)", "ROTCD (%)", "TRADE (%)", "ROCE (%)", "ROA (%)",
     "── Absolute ──",
     "Net Profit (DKK)", "EBIT (DKK)", "Revenue (DKK)", "Opening Equity (DKK)", "Equity (DKK)",
     "── Margins ──",
@@ -188,7 +193,7 @@ def load_employee_monthly() -> pd.DataFrame:
     con = duckdb.connect(str(DB_PATH), read_only=True)
     try:
         df = con.execute("""
-            SELECT e.cvr, c.navn, c.is_intraday, c.is_multidesk, c.is_hedgefund,
+            SELECT e.cvr, c.navn, c.is_intraday, c.is_multidesk, c.is_us_trading, c.is_hedgefund,
                    e.aar, e.maaned, e.antal_ansatte, e.antal_aarsvaerk,
                    make_date(e.aar, e.maaned, 1) AS dato
             FROM employee_monthly e
@@ -266,6 +271,21 @@ def load_data() -> pd.DataFrame:
     )
     df["rooe_pct"] = (df["aarsresultat"] / opening_equity * 100).round(2)
 
+    # Opening related-party loans — used by both ROTCD and TRADE below.
+    opening_related = df.groupby("cvr")["gaeld_tilknyttede"].shift(1).fillna(0)
+
+    # ROTCD: same as ROOE but denominator includes opening related-party loans.
+    # For first-year companies where opening_equity is NaN due to thin equity capitalisation
+    # (e.g. ApS funded via shareholder loans), falls back to closing (equity - profit + loans)
+    # as the opening capital proxy, bypassing the 1M equity-only guard.
+    opening_total_normal = opening_equity + opening_related
+    first_year_total = (df["egenkapital"] - df["aarsresultat"] + df["gaeld_tilknyttede"]).where(
+        opening_total_normal.isna()
+        & ((df["egenkapital"] - df["aarsresultat"] + df["gaeld_tilknyttede"]) >= 1e6)
+    )
+    opening_total_capital = opening_total_normal.fillna(first_year_total)
+    df["rotcd_pct"] = (df["aarsresultat"] / opening_total_capital.where(opening_total_capital >= 1e6) * 100).round(2)
+
     # TRADE: Gross Trading Profit / (Headcount × Opening Equity) × 100
     # Use bruttoresultat (gross profit line) when available — fixes gross-presenters like
     # Mind Energy whose omsaetning is full retail revenue, not the net trading margin.
@@ -276,7 +296,6 @@ def load_data() -> pd.DataFrame:
     # Deployed capital = opening equity + opening related-party loans.
     # Related-party loans (gæld til tilknyttede virksomheder) are often how owners fund
     # trading operations instead of formal equity — economically equivalent, so both count.
-    opening_related = df.groupby("cvr")["gaeld_tilknyttede"].shift(1).fillna(0)
     deployed_capital = opening_equity + opening_related
     # Suppress TRADE when deployed capital is near-zero — ratio is undefined for dormant firms.
     valid_deployed = deployed_capital.where(deployed_capital >= 1e6)
@@ -413,6 +432,70 @@ with st.sidebar:
         "Re-run `uv run tradertracker --fetch` to refresh."
     )
 
+    st.divider()
+
+    if st.button(
+        "🔄 Refresh Data",
+        use_container_width=True,
+        type="primary",
+        help="Fetch latest company data and annual reports from cvr.dev + Virk.dk",
+    ):
+        import re
+        import subprocess
+
+        _status = st.empty()
+        _bar = st.progress(0.0, text="Starting…")
+        _log = st.empty()
+
+        log_lines: list[str] = []
+        _status.info("Launching pipeline…")
+
+        try:
+            proc = subprocess.Popen(
+                ["uv", "run", "tradertracker", "--fetch", "--export"],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                cwd=str(Path(__file__).parent.parent),
+            )
+
+            for raw in iter(proc.stdout.readline, ""):
+                line = raw.rstrip()
+                if not line:
+                    continue
+                log_lines.append(line)
+                _log.code("\n".join(log_lines[-12:]), language="shell")
+
+                m = re.search(r"\[(\d+)/(\d+)\]", line)
+                if m:
+                    i, n = int(m.group(1)), int(m.group(2))
+                    _bar.progress(0.05 + (i / n) * 0.85, text=f"Company {i} / {n}…")
+                    _status.info(f"Fetching financials — **{i} / {n}** companies done")
+                elif "companies found" in line.lower():
+                    _bar.progress(0.04, text="Company list built…")
+                    _status.info(line.strip())
+                elif "Computing KPIs" in line:
+                    _bar.progress(0.93, text="Computing KPIs…")
+                    _status.info("Computing KPIs and exporting to Excel…")
+
+            proc.wait()
+
+            if proc.returncode == 0:
+                _bar.progress(1.0, text="Complete!")
+                _status.success("Data refresh complete! Click below to reload.")
+                st.cache_data.clear()
+                if st.button("↺ Reload dashboard", key="reload_after_fetch"):
+                    st.rerun()
+            else:
+                _status.error("Pipeline failed — see log above for details.")
+
+        except FileNotFoundError:
+            _status.error("`uv` not found in PATH. Is the environment active?")
+        except Exception as exc:
+            _status.error(f"Unexpected error: {exc}")
+
 
 # ── Apply filters + currency ──────────────────────────────────────────────────
 
@@ -469,7 +552,7 @@ df_snap_ops = df_snap[~df_snap["is_restructuring"].fillna(False)]
 _rev      = df_snap["omsaetning"].sum()
 _profit   = df_snap["aarsresultat"].sum()
 _roe      = df_snap["roe_pct"].median()
-_rooe     = df_snap["rooe_pct"].median()
+_rotcd    = df_snap["rotcd_pct"].median()
 _nm       = df_snap["net_margin_pct"].median()
 _emp_tot  = df_snap["ansatte"].sum()
 _emp_med  = df_snap["ansatte"].median()
@@ -494,7 +577,7 @@ _kpis = [
     ("Total Revenue",        _bn(_rev)),
     ("Total Net Profit",     _bn(_profit)),
     ("Median ROE",           _pct(_roe)),
-    ("Median ROOE",          _pct(_rooe)),
+    ("Median ROTCD",          _pct(_rotcd)),
     ("Median Net Margin",    _pct(_nm)),
     ("Total Employees",      _num(_emp_tot)),
     ("Median Headcount",     _num(_emp_med, 0)),
@@ -574,10 +657,10 @@ with tab_overview:
         )
 
     with col_r2:
-        df_rooe = df_snap_ops.dropna(subset=["rooe_pct"]).sort_values("rooe_pct", ascending=False).head(15)
+        df_rotcd = df_snap_ops.dropna(subset=["rotcd_pct"]).sort_values("rotcd_pct", ascending=False).head(15)
         st.plotly_chart(
-            _bar_with_negatives(df_rooe, "rooe_pct", "ROOE (%)",
-                                f"ROOE (%) — top 15 ({selected_year})", height=420,
+            _bar_with_negatives(df_rotcd, "rotcd_pct", "ROTCD (%)",
+                                f"ROTCD (%) — top 15 ({selected_year})", height=420,
                                 color_map=_overview_cmap),
             width="stretch",
         )
@@ -770,16 +853,27 @@ with tab_intraday:
             "Many intraday firms are young — try a recent year or check if they have filed yet."
         )
     else:
-        i1, i2, i3, i4 = st.columns(4)
+        i1, i2, i3, i4, i5 = st.columns(5)
         i1.metric("Firms with data", len(df_intra))
         roe_med = df_intra["roe_pct"].median()
-        i2.metric("Median ROE", f"{roe_med:.1f} %" if pd.notna(roe_med) else "N/A")
-        rooe_med = df_intra["rooe_pct"].median()
-        i3.metric("Median ROOE", f"{rooe_med:.1f} %" if pd.notna(rooe_med) else "N/A")
-        ppe_med = df_intra["resultat_per_ansatte_tdkk"].median()
+        i2.metric("Median ROE", f"{roe_med:.1f} %" if pd.notna(roe_med) else "N/A",
+                  help="Return on Equity = net profit / closing equity.")
+        rotcd_med = df_intra["rotcd_pct"].median()
+        i3.metric("Median ROTCD", f"{rotcd_med:.1f} %" if pd.notna(rotcd_med) else "N/A",
+                  help="Return on Total Capital Deployed = net profit / opening (equity + related-party loans). "
+                       "Identical to ROOE when there are no intercompany loans; more realistic for thinly-capitalised "
+                       "first-year firms funded via shareholder debt.")
+        profit_med = df_intra["aarsresultat"].median()
         i4.metric(
+            "Median Net Profit",
+            _bn(profit_med) if pd.notna(profit_med) else "N/A",
+            help="Median net profit across intraday firms for the selected year.",
+        )
+        ppe_med = df_intra["resultat_per_ansatte_tdkk"].median()
+        i5.metric(
             "Median Profit / Employee",
             f"{ppe_med:,.0f} t{currency}" if pd.notna(ppe_med) else "N/A",
+            help="Net profit per employee — proxy for team quality and capital efficiency.",
         )
 
         st.divider()
@@ -821,10 +915,10 @@ with tab_intraday:
             )
 
         with col4:
-            df_plot = df_intra.dropna(subset=["rooe_pct"]).sort_values("rooe_pct", ascending=False)
+            df_plot = df_intra.dropna(subset=["rotcd_pct"]).sort_values("rotcd_pct", ascending=False)
             st.plotly_chart(
-                _bar_with_negatives(df_plot, "rooe_pct", "ROOE (%)",
-                                    f"Return on Opening Equity ({selected_year})",
+                _bar_with_negatives(df_plot, "rotcd_pct", "ROTCD (%)",
+                                    f"Return on Total Capital Deployed ({selected_year})",
                                     height=max(360, len(df_plot) * 26),
                                     use_intraday_color=False),
                 width="stretch",
@@ -852,19 +946,19 @@ with tab_intraday:
                         y="roe_pct",
                         size="_bubble_size",
                         text="navn",
-                        color="rooe_pct",
+                        color="rotcd_pct",
                         color_continuous_scale="RdYlGn",
                         hover_name="navn",
                         hover_data={
                             "aarsresultat": ":,.0f",
-                            "rooe_pct": ":.1f",
+                            "rotcd_pct": ":.1f",
                             "equity_ratio_pct": ":.1f",
                             "roe_pct": ":.1f",
                         },
                         labels={
                             "equity_ratio_pct": "Equity Ratio (%)",
                             "roe_pct": "ROE (%)",
-                            "rooe_pct": "ROOE (%)",
+                            "rotcd_pct": "ROTCD (%)",
                             "aarsresultat": _ccy("Net Profit (DKK)"),
                         },
                     )
