@@ -127,6 +127,11 @@ METRICS: dict[str, dict] = {
         "fmt": ".1f",
         "help": "Return on Total Capital Deployed = net profit / opening (equity + related-party loans). Identical to ROOE for companies with no intercompany debt. More realistic for thinly-capitalised firms funded via shareholder loans — common for new ApS setups where the owner injects capital as a loan rather than formal equity.",
     },
+    "Total Capital Deployed (DKK)": {
+        "col": "total_capital_deployed",
+        "fmt": ",.0f",
+        "help": "Closing equity + related-party loans (gæld til tilknyttede virksomheder). Captures the full capital the owner has committed to the business, regardless of whether it is structured as formal equity or intercompany debt.",
+    },
     "TRADE (%)": {
         "col": "trade_pct",
         "fmt": ".1f",
@@ -149,7 +154,7 @@ _METRIC_ORDER = [
     "── Returns ──",
     "ROE (%)", "ROOE (%)", "ROTCD (%)", "TRADE (%)", "ROCE (%)", "ROA (%)",
     "── Absolute ──",
-    "Net Profit (DKK)", "EBIT (DKK)", "Revenue (DKK)", "Opening Equity (DKK)", "Equity (DKK)",
+    "Net Profit (DKK)", "EBIT (DKK)", "Revenue (DKK)", "Opening Equity (DKK)", "Equity (DKK)", "Total Capital Deployed (DKK)",
     "── Margins ──",
     "Net Margin (%)", "EBIT Margin (%)",
     "── Per Employee ──",
@@ -285,6 +290,7 @@ def load_data() -> pd.DataFrame:
     )
     opening_total_capital = opening_total_normal.fillna(first_year_total)
     df["rotcd_pct"] = (df["aarsresultat"] / opening_total_capital.where(opening_total_capital >= 1e6) * 100).round(2)
+    df["total_capital_deployed"] = df["egenkapital"] + df["gaeld_tilknyttede"]
 
     # TRADE: Gross Trading Profit / (Headcount × Opening Equity) × 100
     # Use bruttoresultat (gross profit line) when available — fixes gross-presenters like
