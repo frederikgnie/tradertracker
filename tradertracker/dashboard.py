@@ -6,6 +6,7 @@ Run with:
     uv run streamlit run tradertracker/dashboard.py
 """
 
+from datetime import datetime, timedelta
 from pathlib import Path
 
 import duckdb
@@ -433,17 +434,20 @@ with st.sidebar:
     EUR_DKK_DISPLAY = 7.46
 
     st.divider()
-    st.caption(
-        "Data: cvr.dev API + Virk XBRL annual reports. "
-        "Re-run `uv run tradertracker --fetch` to refresh."
-    )
 
-    st.divider()
+    _FETCH_COOLDOWN = timedelta(hours=1)
+    _last_fetch = st.session_state.get("last_fetch_time")
+    _cooldown_active = _last_fetch is not None and (datetime.now() - _last_fetch) < _FETCH_COOLDOWN
+    if _cooldown_active:
+        _remaining = _FETCH_COOLDOWN - (datetime.now() - _last_fetch)
+        _mins, _secs = divmod(int(_remaining.total_seconds()), 60)
+        st.caption(f"Next refresh available in **{_mins}m {_secs}s**")
 
     if st.button(
         "🔄 Refresh Data",
         use_container_width=True,
         type="primary",
+        disabled=_cooldown_active,
         help="Fetch latest company data and annual reports from cvr.dev + Virk.dk",
     ):
         import re
@@ -491,6 +495,7 @@ with st.sidebar:
             if proc.returncode == 0:
                 _bar.progress(1.0, text="Complete!")
                 _status.success("Data refresh complete! Click below to reload.")
+                st.session_state["last_fetch_time"] = datetime.now()
                 st.cache_data.clear()
                 if st.button("↺ Reload dashboard", key="reload_after_fetch"):
                     st.rerun()

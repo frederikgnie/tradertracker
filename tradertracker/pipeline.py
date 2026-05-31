@@ -135,6 +135,7 @@ EXPLICIT_CVR: set[int] = {
     28113951,  # DANSKE COMMODITIES A/S        NACE 351590
     17225898,  # Mind Energy A/S (Energi Danmark) NACE 351590
     38381954,  # In Commodities A/S            NACE 351590
+    45136132,  # In Commodities Asset Management A/S NACE 351590
     38175130,  # MFT Energy A/S                NACE 354000
     38680781,  # Nitor Energy A/S              NACE 351590
     41419849,  # Norlys Energy Trading A/S     NACE 351590
@@ -144,6 +145,9 @@ EXPLICIT_CVR: set[int] = {
 US_TRADING_CVR: set[int] = {
     43495127,  # Nabla Technologies ApS      NACE 621000 (non-standard)
     44882906,  # Halia Energy ApS            NACE 351590
+    44632691,  # Arcane Energy US ApS        NACE 351590
+    45053326,  # BD Energy US ApS            NACE 351590
+    44238837,  # ENZEE Commodities US ApS    NACE 351590
     # MFT Energy US 1 — CVR unknown (possibly US-registered entity)
     # MFT Energy US 2 — CVR unknown (possibly US-registered entity)
 }
