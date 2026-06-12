@@ -659,6 +659,14 @@ def _elem_concept(tag: str) -> str:
 
 # ── API client ─────────────────────────────────────────────────────────────────
 
+class _CvrDevDown(Exception):
+    pass
+
+
+_cvrapi_fallback: bool = False
+APICVR_BASE = "https://apicvr.dk/api/v1"
+
+
 def _headers() -> dict[str, str]:
     key = os.environ.get("CVR_DEV_API_KEY", "")
     if not key:
@@ -667,9 +675,57 @@ def _headers() -> dict[str, str]:
 
 
 def _get(path: str, params: dict | None = None):
+    global _cvrapi_fallback
+    if _cvrapi_fallback:
+        raise _CvrDevDown()
     r = httpx.get(f"{API_BASE}/{path}", headers=_headers(), params=params, timeout=30)
+    if r.status_code == 402:
+        _cvrapi_fallback = True
+        print("  cvr.dev subscription inactive — falling back to apicvr.dk")
+        raise _CvrDevDown()
     r.raise_for_status()
     return r.json() if r.content else []
+
+
+def _normalize_apicvr(data: dict) -> dict:
+    """Wrap apicvr.dk response into the virk-style nested structure the pipeline expects."""
+    status = "NORMAL" if not data.get("enddate") and not data.get("bankrupt") else "OPHØRT"
+    return {
+        "cvrNummer": data.get("vat"),
+        "virksomhedMetadata": {
+            "sammensatStatus": status,
+            "stiftelsesDato": data.get("startdate"),  # already ISO YYYY-MM-DD
+            "nyesteNavn": {"navn": data.get("name") or ""},
+            "nyesteHovedbranche": {
+                "branchekode": str(data.get("industrycode") or ""),
+                "branchetekst": data.get("industrydesc") or "",
+            },
+            "nyesteAarsbeskaeftigelse": {
+                "antalAnsatte": data.get("employees"),
+                "antalAarsvaerk": None,
+            },
+            "nyesteBeliggenhedsadresse": {
+                "vejnavn": data.get("address") or "",
+                "postnummer": data.get("zipcode"),
+                "postdistrikt": data.get("city") or "",
+            },
+        },
+        "erstMaanedsbeskaeftigelse": [],
+    }
+
+
+def _get_apicvr(path: str) -> list[dict]:
+    """Fetch from apicvr.dk, return a normalized list of companies."""
+    r = httpx.get(f"{APICVR_BASE}/{path}", timeout=30)
+    if r.status_code == 404:
+        return []
+    r.raise_for_status()
+    data = r.json() if r.content else None
+    if not data:
+        return []
+    if isinstance(data, list):
+        return [_normalize_apicvr(c) for c in data]
+    return [_normalize_apicvr(data)]
 
 
 # ── Company discovery ──────────────────────────────────────────────────────────
@@ -688,6 +744,8 @@ def discover_companies() -> list[dict]:
     for term in SEARCH_TERMS:
         try:
             batch = _get("api/cvr/virksomhed", {"navn": term})
+        except _CvrDevDown:
+            batch = _get_apicvr(f"search/company/{term}")
         except httpx.HTTPStatusError:
             continue
         if not isinstance(batch, list):
@@ -713,6 +771,11 @@ def discover_companies() -> list[dict]:
             batch = _get("api/cvr/virksomhed", {"cvr_nummer": cvr})
             if batch and isinstance(batch, list):
                 results.append(batch[0])
+                seen.add(cvr)
+        except _CvrDevDown:
+            apicvr = _get_apicvr(str(cvr))
+            if apicvr:
+                results.append(apicvr[0])
                 seen.add(cvr)
         except httpx.HTTPStatusError:
             pass
@@ -947,6 +1010,25 @@ def _sum_facts(facts: dict, period_end: str, *concepts: str) -> float | None:
     return total if found else None
 
 
+VIRK_ES = "http://distribution.virk.dk/offentliggoerelser/_search"
+
+
+def _get_regnskab_virk(cvr: int) -> list[dict]:
+    """Fetch annual report filings from Erhvervsstyrelsen's public Elasticsearch API."""
+    r = httpx.post(
+        VIRK_ES,
+        json={
+            "query": {"term": {"cvrNummer": cvr}},
+            "_source": ["dokumenter", "regnskab.regnskabsperiode"],
+            "size": 50,
+            "sort": [{"offentliggoerelsesTidspunkt": "desc"}],
+        },
+        timeout=30,
+    )
+    r.raise_for_status()
+    return [h["_source"] for h in r.json()["hits"]["hits"]]
+
+
 def fetch_and_parse_financials(
     cvr: int, skip_periods: set[str] | None = None
 ) -> list[dict]:
@@ -957,6 +1039,11 @@ def fetch_and_parse_financials(
     """
     try:
         recs = _get("api/cvr/regnskab", {"cvr_nummer": cvr})
+    except _CvrDevDown:
+        try:
+            recs = _get_regnskab_virk(cvr)
+        except Exception:
+            return []
     except httpx.HTTPStatusError:
         return []
     if not isinstance(recs, list):
