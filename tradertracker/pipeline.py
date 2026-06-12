@@ -27,9 +27,9 @@ from xml.etree import ElementTree as ET
 import duckdb
 import httpx
 import pandas as pd
-from dotenv import load_dotenv
+from dotenv import find_dotenv, load_dotenv
 
-load_dotenv()
+load_dotenv(find_dotenv(usecwd=True))
 
 # ── Configuration ──────────────────────────────────────────────────────────────
 
