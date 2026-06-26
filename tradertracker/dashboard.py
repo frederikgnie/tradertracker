@@ -450,8 +450,14 @@ with st.sidebar:
         disabled=_cooldown_active,
         help="Fetch latest company data and annual reports from cvr.dev + Virk.dk",
     ):
+        import os
         import re
         import subprocess
+
+        from dotenv import load_dotenv
+
+        _project_root = Path(__file__).resolve().parent.parent
+        load_dotenv(_project_root / ".env")
 
         _status = st.empty()
         _bar = st.progress(0.0, text="Starting…")
@@ -468,7 +474,8 @@ with st.sidebar:
                 text=True,
                 encoding="utf-8",
                 errors="replace",
-                cwd=str(Path(__file__).parent.parent),
+                cwd=str(_project_root),
+                env={**os.environ},
             )
 
             for raw in iter(proc.stdout.readline, ""):

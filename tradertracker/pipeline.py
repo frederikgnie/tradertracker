@@ -1050,6 +1050,7 @@ def fetch_and_parse_financials(
         return []
 
     rows: list[dict] = []
+    fetched_periods: set[str] = set()  # deduplicate within this run (amendments etc.)
     for rec in recs:
         period = (rec.get("regnskab") or {}).get("regnskabsperiode") or {}
         period_end = period.get("slutDato")
@@ -1059,6 +1060,11 @@ def fetch_and_parse_financials(
         # Skip periods we already have in the DB
         if skip_periods and period_end in skip_periods:
             continue
+
+        # Skip duplicate periods within this fetch (e.g. original + amendment)
+        if period_end in fetched_periods:
+            continue
+        fetched_periods.add(period_end)
 
         # Find the best XBRL document (prefer xhtml inline XBRL, fall back to xml)
         xhtml_url = next(
