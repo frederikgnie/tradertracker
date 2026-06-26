@@ -9,11 +9,20 @@ Run with:
 from datetime import datetime, timedelta
 from pathlib import Path
 
+import os
+
 import duckdb
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
 import streamlit as st
+
+# Streamlit Cloud delivers secrets via st.secrets, not os.environ.
+# Inject them so the pipeline subprocess can inherit them.
+for _k in ("CVR_DEV_API_KEY",):
+    if _k in st.secrets and not os.environ.get(_k):
+        os.environ[_k] = st.secrets[_k]
+
 from tradertracker.pipeline import EXCLUDED_CVR
 
 DB_PATH = Path("data/tradertracker.duckdb")
@@ -453,11 +462,12 @@ with st.sidebar:
         import os
         import re
         import subprocess
+        import sys
 
         from dotenv import load_dotenv
 
         _project_root = Path(__file__).resolve().parent.parent
-        load_dotenv(_project_root / ".env")
+        load_dotenv(_project_root / ".env", override=True)
 
         _status = st.empty()
         _bar = st.progress(0.0, text="Starting…")
@@ -468,7 +478,7 @@ with st.sidebar:
 
         try:
             proc = subprocess.Popen(
-                ["uv", "run", "tradertracker", "--fetch", "--export"],
+                [sys.executable, "-m", "tradertracker.pipeline", "--fetch", "--export"],
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
                 text=True,
@@ -510,7 +520,7 @@ with st.sidebar:
                 _status.error("Pipeline failed — see log above for details.")
 
         except FileNotFoundError:
-            _status.error("`uv` not found in PATH. Is the environment active?")
+            _status.error("Python interpreter not found. Is the environment active?")
         except Exception as exc:
             _status.error(f"Unexpected error: {exc}")
 
