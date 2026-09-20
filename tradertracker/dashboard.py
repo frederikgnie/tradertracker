@@ -9,11 +9,28 @@ Run with:
 from datetime import datetime, timedelta
 from pathlib import Path
 
+import os
+
 import duckdb
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
 import streamlit as st
+
+# Streamlit Cloud delivers secrets via st.secrets, not os.environ.
+# Inject them so the pipeline subprocess can inherit them.
+# Locally there is usually no secrets.toml at all, and touching st.secrets then
+# raises rather than returning empty — which used to take the whole dashboard
+# down before it rendered a single line. Absent secrets is a normal local state.
+try:
+    _secrets = dict(st.secrets)
+except Exception:  # noqa: BLE001 - StreamlitSecretNotFoundError and friends
+    _secrets = {}
+for _k in ("CVR_DEV_API_KEY",):
+    if _secrets.get(_k) and not os.environ.get(_k):
+        os.environ[_k] = _secrets[_k]
+
+from tradertracker import fiscalyear as fy
 from tradertracker.pipeline import EXCLUDED_CVR
 
 DB_PATH = Path("data/tradertracker.duckdb")
@@ -239,7 +256,35 @@ def load_data() -> pd.DataFrame:
     con.close()
 
     df = df[~df["cvr"].isin(EXCLUDED_CVR)].copy()
-    df["year"] = pd.to_datetime(df["regnskab_slut"]).dt.year
+
+    # ── Fiscal-year attribution (skævt regnskabsår) ───────────────────────────
+    # ~13% of filings here close on 30 June / 30 September rather than
+    # 31 December, and ~13% cover something other than twelve months. Bucketing
+    # on the closing date alone puts a Jul-2023..Jun-2024 year next to calendar
+    # 2024 — periods that share no second half. Attribute on the midpoint
+    # instead; see tradertracker/fiscalyear.py for the rule.
+    _start = df["regnskab_start"] if "regnskab_start" in df.columns else None
+    if _start is None:  # DB predates the kpis-view change — assume 12 months
+        _start = pd.to_datetime(df["regnskab_slut"]) - pd.Timedelta(days=364)
+    df["fy_start"] = list(_start)
+    _periods = list(zip(df["fy_start"], df["regnskab_slut"]))
+
+    df["year"] = [fy.fiscal_year(a, b) for a, b in _periods]
+    df["fy_label"] = [fy.fiscal_year_label(a, b) for a, b in _periods]
+    df["period_months"] = [fy.period_months(a, b) for a, b in _periods]
+    df["is_annual_period"] = [fy.is_annual(a, b) for a, b in _periods]
+    df["is_offset_fy"] = [fy.is_offset_year_end(b) for _, b in _periods]
+    df["fy_end_month"] = pd.to_datetime(df["regnskab_slut"]).dt.month
+
+    df = df.dropna(subset=["year"])
+    df["year"] = df["year"].astype(int)
+
+    # A company changing its year-end files two periods that can land in the
+    # same fiscal year (e.g. a 12-month Sep..Aug period plus a 4-month stub to
+    # 31 December). Keep the longer — the one that actually represents the
+    # year — and flag the rest so they can be listed rather than vanish.
+    df = df.sort_values(["cvr", "year", "period_months"], ascending=[True, True, False])
+    df["fy_superseded"] = df.duplicated(subset=["cvr", "year"], keep="first")
 
     # Derived metrics not in the SQL view
     # Use float NaN (not pd.NA) so .round() works on all pandas versions
@@ -252,10 +297,26 @@ def load_data() -> pd.DataFrame:
     df["ebit_margin_pct"] = (df["ebit"] / revenue * 100).round(2)
     df["equity_ratio_pct"] = (equity / assets * 100).round(1)
 
-    # YoY revenue growth per company
-    df = df.sort_values(["cvr", "year"])
+    # YoY revenue growth per company.
+    # Flows are annualised first: an 18-month first period holds ~1.5 years of
+    # revenue, so differencing it raw against a following 12-month year invents
+    # a ~33% collapse that never happened. Growth is also suppressed across a
+    # gap in the fiscal-year sequence, where there is no true prior year.
+    df = df.sort_values(["cvr", "regnskab_slut"])
+    _annualise = pd.Series(
+        [fy.annualisation_factor(a, b)
+         for a, b in zip(df["fy_start"], df["regnskab_slut"])],
+        index=df.index,
+    )
+    df["omsaetning_annualiseret"] = df["omsaetning"] * _annualise
+    _prior_year = df.groupby("cvr")["year"].shift(1)
+    _consecutive = (df["year"] - _prior_year) == 1
     df["rev_growth_pct"] = (
-        df.groupby("cvr")["omsaetning"].pct_change().mul(100).round(1)
+        df.groupby("cvr")["omsaetning_annualiseret"]
+        .pct_change()
+        .where(_consecutive)
+        .mul(100)
+        .round(1)
     )
 
     # Opening equity: prefer egenkapital_primo parsed from XBRL comparative figures,
@@ -413,7 +474,41 @@ with st.sidebar:
         "Financial year",
         options=all_years,
         index=0,
+        help=(
+            "Fiscal years are attributed to the calendar year holding most of "
+            "the period (the midpoint), not to the closing date. A company "
+            "closing 30 June 2024 covers Jul 2023–Jun 2024 and is therefore "
+            "shown under 2023, alongside the calendar-2023 filers it actually "
+            "traded against."
+        ),
     )
+
+    _off = df_all[(df_all["year"] == selected_year) & df_all["is_offset_fy"]
+                  & (~df_all["fy_superseded"])]
+    _stub = df_all[(df_all["year"] == selected_year) & (~df_all["is_annual_period"])
+                   & (~df_all["fy_superseded"])]
+    if len(_off) or len(_stub):
+        with st.expander(f"⚠ Skævt regnskabsår — {len(_off)} firm(s)", expanded=False):
+            if len(_off):
+                st.caption(
+                    f"{len(_off)} company/companies in {selected_year} do not close "
+                    "on 31 December. Shown under the year holding most of their period."
+                )
+                st.dataframe(
+                    _off[["navn", "fy_label", "regnskab_start", "regnskab_slut",
+                          "period_months"]]
+                    .rename(columns={"navn": "Company", "fy_label": "FY",
+                                     "regnskab_start": "From", "regnskab_slut": "To",
+                                     "period_months": "Months"})
+                    .sort_values("To"),
+                    hide_index=True, width="stretch",
+                )
+            if len(_stub):
+                st.caption(
+                    f"{len(_stub)} period(s) are not ~12 months (first-year stubs or "
+                    "year-end changes). Revenue growth is annualised for these; "
+                    "level figures are as filed."
+                )
 
     intraday_filter = st.radio(
         "Company category",
@@ -445,7 +540,7 @@ with st.sidebar:
 
     if st.button(
         "🔄 Refresh Data",
-        use_container_width=True,
+        width="stretch",
         type="primary",
         disabled=_cooldown_active,
         help="Fetch latest company data and annual reports from cvr.dev + Virk.dk",
@@ -453,11 +548,12 @@ with st.sidebar:
         import os
         import re
         import subprocess
+        import sys
 
         from dotenv import load_dotenv
 
         _project_root = Path(__file__).resolve().parent.parent
-        load_dotenv(_project_root / ".env")
+        load_dotenv(_project_root / ".env", override=True)
 
         _status = st.empty()
         _bar = st.progress(0.0, text="Starting…")
@@ -468,7 +564,7 @@ with st.sidebar:
 
         try:
             proc = subprocess.Popen(
-                ["uv", "run", "tradertracker", "--fetch", "--export"],
+                [sys.executable, "-m", "tradertracker.pipeline", "--fetch", "--export"],
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
                 text=True,
@@ -510,7 +606,7 @@ with st.sidebar:
                 _status.error("Pipeline failed — see log above for details.")
 
         except FileNotFoundError:
-            _status.error("`uv` not found in PATH. Is the environment active?")
+            _status.error("Python interpreter not found. Is the environment active?")
         except Exception as exc:
             _status.error(f"Unexpected error: {exc}")
 
@@ -559,8 +655,12 @@ def _apply_category(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-df_snap = _apply_currency(_apply_category(df_all[df_all["year"] == selected_year].copy()))
-df_ts = _apply_currency(_apply_category(df_all.copy()))
+df_snap = _apply_currency(_apply_category(
+    df_all[(df_all["year"] == selected_year) & (~df_all["fy_superseded"])].copy()
+))
+# Time series: one point per company per fiscal year. A superseded transition
+# stub would otherwise plot a second, part-year point on top of the real one.
+df_ts = _apply_currency(_apply_category(df_all[~df_all["fy_superseded"]].copy()))
 
 # Operational snapshot: excludes restructuring years (disposal gains, wind-downs) from charts
 df_snap_ops = df_snap[~df_snap["is_restructuring"].fillna(False)]
@@ -984,7 +1084,7 @@ with tab_intraday:
                     fig.add_vline(x=0, line_dash="dot", line_color="gray", opacity=0.5)
                     fig.update_traces(textposition="top center")
                     fig.update_layout(height=480)
-                    st.plotly_chart(fig, use_container_width=True)
+                    st.plotly_chart(fig, width="stretch")
 
             if not df_pie.empty:
                 with pie_col:
@@ -1006,7 +1106,7 @@ with tab_intraday:
                         showlegend=False,
                         margin=dict(t=40, b=10, l=10, r=10),
                     )
-                    st.plotly_chart(fig_pie, use_container_width=True)
+                    st.plotly_chart(fig_pie, width="stretch")
                     n_neg = len(df_intra[df_intra["aarsresultat"] <= 0].dropna(subset=["aarsresultat"]))
                     if n_neg:
                         st.caption(f"{n_neg} firm(s) with zero or negative profit excluded.")
@@ -1327,7 +1427,7 @@ with tab_sankey:
         if _fig is None and not _row.get("is_restructuring"):
             st.warning("Insufficient data to draw Sankey — trading income is zero or missing.")
         else:
-            st.plotly_chart(_fig, use_container_width=True)
+            st.plotly_chart(_fig, width="stretch")
 
         # Quick data availability summary
         _fields = {
@@ -1477,7 +1577,7 @@ with tab_map:
             legend=dict(title="Category", x=0.01, y=0.99, bgcolor="rgba(0,0,0,0.5)"),
         )
 
-        st.plotly_chart(fig_map, use_container_width=True, config={"scrollZoom": True})
+        st.plotly_chart(fig_map, width="stretch", config={"scrollZoom": True})
         st.caption(
             f"Showing {len(map_df)} companies. Coordinates are city-level approximations "
             "seeded from company names — run `python geocode_companies.py` for exact addresses "

@@ -1226,6 +1226,7 @@ WITH base AS (
         c.alder_aar,
         c.ansatte                                                            AS ansatte_register,
         f.regnskab_slut,
+        f.regnskab_start,
         f.omsaetning,
         f.ebit,
         f.aarsresultat,
@@ -1250,7 +1251,11 @@ WITH base AS (
             CAST(f.ansatte_regnskab AS INTEGER),
             (SELECT CAST(ROUND(AVG(e.antal_ansatte)) AS INTEGER)
              FROM employee_monthly e
-             WHERE e.cvr = c.cvr AND e.aar = YEAR(f.regnskab_slut)),
+             WHERE e.cvr = c.cvr
+               AND MAKE_DATE(e.aar, e.maaned, 1) BETWEEN
+                   DATE_TRUNC('month',
+                       COALESCE(f.regnskab_start, f.regnskab_slut - INTERVAL 364 DAY))
+                   AND f.regnskab_slut),
             c.ansatte
         )                                                                    AS ansatte
     FROM companies c
@@ -1258,7 +1263,7 @@ WITH base AS (
 )
 SELECT
     cvr, navn, is_intraday, is_multidesk, is_us_trading, is_hedgefund, branche_kode, branche_tekst, alder_aar,
-    ansatte_register, regnskab_slut, omsaetning, ebit, aarsresultat,
+    ansatte_register, regnskab_slut, regnskab_start, omsaetning, ebit, aarsresultat,
     egenkapital, egenkapital_primo, aktiver, ansatte,
     personaleomkostninger, bruttoresultat, vareforbrug, afskrivninger,
     fin_indt, fin_udg, skat, udbytte,
