@@ -44,6 +44,14 @@ class TestFiscalYear:
             ("2023-01-01", "2024-06-30", 2023),
             # 6-month stub.
             ("2023-07-01", "2023-12-31", 2023),
+            # 11-month first period of a June closer (PowerCom): its own
+            # midpoint is January 2024, but it is the company's 2023/24 year.
+            ("2023-07-27", "2024-06-30", 2023),
+            # 7.7-month first period of a June closer (Aarhus Energy).
+            ("2023-11-09", "2024-06-30", 2023),
+            # Transition stub after moving the year-end from December to
+            # March (Reel PPA): shares 2025 with the calendar year it follows.
+            ("2026-01-01", "2026-03-31", 2025),
         ],
     )
     def test_midpoint_attribution(self, start, end, expected):
@@ -54,6 +62,13 @@ class TestFiscalYear:
         naive = date.fromisoformat("2024-06-30").year
         assert naive == 2024
         assert fiscal_year("2023-07-01", "2024-06-30") == 2023
+
+    def test_consecutive_june_years_never_collide(self):
+        """A first-year stub must not land in the same year as the next full year."""
+        first = fiscal_year("2023-07-27", "2024-06-30")
+        second = fiscal_year("2024-07-01", "2025-06-30")
+        assert first is not None
+        assert second == first + 1
 
     def test_missing_start_assumes_twelve_months(self):
         assert fiscal_year(None, "2024-06-30") == 2023

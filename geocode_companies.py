@@ -5,12 +5,13 @@ Geocode company addresses and store lat/lon in DuckDB.
 Strategy:
   1. Fetch exact registered address per CVR from api.cvr.dev (individual lookup — separate
      quota from the batch company-discovery search, works even when monthly search quota is full).
-  2. Geocode the address via DAWA (Danmarks Adresseregister) — free, unlimited, exact.
+  2. Geocode the address via OpenStreetMap Nominatim (free, 1 request/second).
+     DAWA, used before, was shut down in 2026 (HTTP 410).
 
 Usage:
     uv run python geocode_companies.py           # geocode only missing companies
     uv run python geocode_companies.py --refresh # re-geocode all companies
-    uv run python geocode_companies.py --seed    # fallback: city-level approx via DAWA only
+    uv run python geocode_companies.py --seed    # fallback: city-level approx, no cvr.dev calls
 """
 
 import argparse
@@ -41,47 +42,53 @@ _CREATE_TABLE = """
 """
 
 
-def _dawa_geocode(vejnavn: str, husnr: str, postnr: str | int) -> tuple[float, float] | None:
-    """Return (lat, lon) for a Danish address via DAWA, or None if not found.
+_NOMINATIM = "https://nominatim.openstreetmap.org/search"
+_last_nominatim_call = 0.0
 
-    husnr should include the letter suffix (e.g. '17A', not just '17').
-    Tries structured search first, then autocomplete fallback (handles special chars + sub-addresses).
+
+def _nominatim(params: dict[str, str]) -> tuple[float, float] | None:
+    """One Nominatim lookup restricted to Denmark, or None.
+
+    The public instance allows at most one request per second and requires an
+    identifying User-Agent, both enforced here.
     """
+    global _last_nominatim_call
+    wait = 1.1 - (time.monotonic() - _last_nominatim_call)
+    if wait > 0:
+        time.sleep(wait)
+    _last_nominatim_call = time.monotonic()
     try:
         r = httpx.get(
-            "https://api.dataforsyningen.dk/adresser",
-            params={"vejnavn": vejnavn, "husnr": husnr, "postnr": str(postnr),
-                    "per_side": 1, "struktur": "mini"},
-            timeout=10,
+            _NOMINATIM,
+            params={**params, "countrycodes": "dk", "format": "jsonv2", "limit": "1"},
+            headers={"User-Agent": _UA},
+            timeout=15,
         )
-        data = r.json()
-        if data:
-            return data[0]["y"], data[0]["x"]  # y=lat, x=lon in DAWA
-    except Exception:
-        pass
-    # Autocomplete fallback — handles Å/Ø/Æ and unusual house number formats
-    try:
-        q = f"{vejnavn} {husnr} {postnr}"
-        r2 = httpx.get(
-            "https://api.dataforsyningen.dk/adresser/autocomplete",
-            params={"q": q, "per_side": 1},
-            timeout=10,
-        )
-        hits = r2.json()
+        hits = r.json() if r.status_code == 200 else []
         if hits:
-            a = hits[0]["adresse"]
-            return a["y"], a["x"]
-    except Exception:
-        pass
-    # Last resort: postal centroid
-    try:
-        r3 = httpx.get(f"https://api.dataforsyningen.dk/postnumre/{postnr}", timeout=10)
-        if r3.status_code == 200:
-            vc = r3.json()["visueltcenter"]
-            return vc[1], vc[0]
+            return float(hits[0]["lat"]), float(hits[0]["lon"])
     except Exception:
         pass
     return None
+
+
+def _postcode_centroid(postnr: str | int) -> tuple[float, float] | None:
+    return _nominatim({"postalcode": str(postnr)})
+
+
+def _geocode(vejnavn: str, husnr: str, postnr: str | int) -> tuple[float, float] | None:
+    """Return (lat, lon) for a Danish address via OpenStreetMap Nominatim, or None.
+
+    DAWA (api.dataforsyningen.dk), used until 2026, now answers 410 Gone.
+    husnr should include the letter suffix (e.g. '17A', not just '17').
+    Falls back to the postcode's centroid when the street address is unknown.
+    """
+    street = f"{husnr} {vejnavn}".strip()
+    return (
+        _nominatim({"street": street, "postalcode": str(postnr)})
+        or _nominatim({"q": f"{vejnavn} {husnr}, {postnr}"})
+        or _postcode_centroid(postnr)
+    )
 
 
 def geocode_all(refresh: bool = False) -> None:
@@ -99,7 +106,7 @@ def geocode_all(refresh: bool = False) -> None:
             ORDER BY c.cvr
         """).fetchall()]
 
-    print(f"Geocoding {len(cvrs)} companies (cvr.dev address + DAWA coordinates)...")
+    print(f"Geocoding {len(cvrs)} companies (cvr.dev address + Nominatim coordinates)...")
     ok = skipped = failed = 0
 
     with httpx.Client(
@@ -148,7 +155,7 @@ def geocode_all(refresh: bool = False) -> None:
                     adresse_str += f", {etage}."
                 adresse_str += f", {postnr} {postby or ''}"
 
-                coords = _dawa_geocode(vejnavn, husnr_full, postnr)
+                coords = _geocode(vejnavn, husnr_full, postnr)
                 if not coords:
                     skipped += 1
                     continue
@@ -172,7 +179,7 @@ def geocode_all(refresh: bool = False) -> None:
     print(f"Done: {ok} geocoded, {skipped} skipped, {failed} failed")
 
 
-# ── Fallback seed: city-inference + DAWA postal centroids ────────────────────
+# ── Fallback seed: city-inference + postcode centroids ────────────────────
 
 _CITY_POSTCODES: dict[str, str] = {
     "aarhus": "8000", "aros": "8000", "kolding": "6000", "odense": "5000",
@@ -215,12 +222,7 @@ def seed_locations(refresh: bool = False) -> None:
     for cvr, navn in rows:
         pc = _infer_postcode(cvr, navn or "")
         if pc not in pc_cache:
-            try:
-                r = httpx.get(f"https://api.dataforsyningen.dk/postnumre/{pc}", timeout=10)
-                vc = r.json()["visueltcenter"]
-                pc_cache[pc] = (vc[1], vc[0])
-            except Exception:
-                pc_cache[pc] = (55.6761, 12.5683)
+            pc_cache[pc] = _postcode_centroid(pc) or (55.6761, 12.5683)
         lat, lon = pc_cache[pc]
         lat += rng.uniform(-0.008, 0.008)
         lon += rng.uniform(-0.012, 0.012)
@@ -239,7 +241,7 @@ if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("--refresh", action="store_true", help="Replace existing entries")
     ap.add_argument("--seed", action="store_true",
-                    help="Fast fallback: city-level approximation via DAWA (no cvr.dev calls)")
+                    help="Fast fallback: city-level approximation (no cvr.dev calls)")
     args = ap.parse_args()
 
     if args.seed:
