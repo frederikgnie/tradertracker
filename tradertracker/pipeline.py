@@ -419,6 +419,18 @@ EXCLUDED_CVR: set[int] = {
     22188410,  # Aal El-Net A M B A — grid distribution (DSO)
 }
 
+# 2026 start-ups registered as electricity traders (NACE 351590) with no public
+# evidence of wholesale trading yet. Not tracked; every --fetch run reports
+# when one files its first annual report so it can be classified from that.
+WATCHLIST_CVR: dict[int, str] = {
+    46864964: "AARK Energy ApS",          # Åbyhøj, owner SFTB Holding ApS
+    46746724: "Key Commodities ApS",      # Tilst, owner M&H Holding ApS
+    46676556: "VerdeX Energy ApS",        # Åbyhøj, four holding-company owners
+    46549724: "Idun Energy ApS",          # Højbjerg
+    46721799: "Scandinavian Energy ApS",  # Lystrup
+    46611365: "Quant Partners ApS",       # Herlev, probably not wholesale
+}
+
 # Pull all pinned firms regardless of NACE code
 EXTRA_CVR: set[int] = (INTRADAY_CVR | EXPLICIT_CVR | US_TRADING_CVR | HEDGE_FUND_CVR | NACE_351590_CVR) - EXCLUDED_CVR
 
@@ -1039,6 +1051,20 @@ def _get_regnskab_virk(cvr: int) -> list[dict]:
     return [h["_source"] for h in r.json()["hits"]["hits"]]
 
 
+def check_watchlist() -> None:
+    """Report WATCHLIST_CVR companies that have published an annual report."""
+    for cvr, name in WATCHLIST_CVR.items():
+        if cvr in EXTRA_CVR or cvr in EXCLUDED_CVR:
+            continue
+        try:
+            filings = _get_regnskab_virk(cvr)
+        except httpx.HTTPError:
+            continue
+        if filings:
+            print(f"  Watchlist: {name} (CVR {cvr}) has filed {len(filings)} "
+                  "annual report(s) - classify it (track or exclude)")
+
+
 def fetch_and_parse_financials(
     cvr: int, skip_periods: set[str] | None = None
 ) -> list[dict]:
@@ -1578,6 +1604,7 @@ def main() -> None:
             financial_rows.extend(fetch_and_parse_financials(cvr, skip_periods=periods))
 
         store(company_rows, financial_rows, employee_monthly_rows)
+        check_watchlist()
 
     if args.export or run_all:
         print("Computing KPIs and exporting to Excel...")
