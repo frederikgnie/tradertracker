@@ -29,6 +29,8 @@ import httpx
 import pandas as pd
 from dotenv import load_dotenv
 
+from tradertracker import fiscalyear as fy
+
 load_dotenv(Path(__file__).resolve().parent.parent / ".env")
 
 # ── Configuration ──────────────────────────────────────────────────────────────
@@ -118,6 +120,7 @@ INTRADAY_CVR: set[int] = {
     45849066,  # Setpoint Energy ApS        NACE 351590 (already in NACE list)
     44590832,  # Quantum Power Trading ApS  NACE 351590
     44967782,  # ENZOL Energy Trading ApS   NACE 351590
+    46729846,  # Halia Energy Europe ApS    NACE 351590 (2026, Halia Energy Group's European arm)
 }
 
 # Hedge funds & international commodity trading firms with a Danish entity.
@@ -139,6 +142,9 @@ EXPLICIT_CVR: set[int] = {
     38175130,  # MFT Energy A/S                NACE 354000
     38680781,  # Nitor Energy A/S              NACE 351590
     41419849,  # Norlys Energy Trading A/S     NACE 351590
+    46868781,  # Decipher ApS                  NACE 351590 (2026, CIP's energy-trading company)
+    46662466,  # LC Commodities A/S            NACE 351590 (2026, Henrik Lind / Lind Capital)
+    46585399,  # In Commodities Stack A/S      NACE 351590 (2026, InCommodities group, Tangen 6)
 }
 
 # US-focused energy traders — trade primarily on US power markets
@@ -249,6 +255,7 @@ EXCLUDED_CVR: set[int] = {
     40450238,  # Nidhog ApS — was briefly active to 2022, then folded into Yggdrasil
     40879196,  # Asgard ApS — shell, zero revenue/employees across all years
     39577445,  # Thordin ApS — shell, zero revenue/employees across all years
+    46480473,  # Mjolnir Trading ApS — founded 2026, 100% Yggdrasil, same directors
     42439258,  # KØRNFULL ENERGI ApS — not a trader
     44747987,  # BioCirc Carbon & Renewables ApS — carbon/renewables, not electricity trader
     34221162,  # NETTOPOWER ApS — not a trader
@@ -407,6 +414,9 @@ EXCLUDED_CVR: set[int] = {
     45112888,  # Divus Nova Finance ApS — finance holding, 0 filings
     46217373,  # Nordic Energy House US LLC — US LLC of Nordic Energy House, 0 DK filings
     43783149,  # El og Energi - Egtved Alle 3-5, Kolding ApS — local utility entity, not a trader
+    21973505,  # VINDENERGI DANMARK AMBA — wind-owner cooperative, not a trader
+    25115627,  # Ikast El Net A/S — grid distribution (DSO)
+    22188410,  # Aal El-Net A M B A — grid distribution (DSO)
 }
 
 # Pull all pinned firms regardless of NACE code
@@ -1233,6 +1243,7 @@ WITH base AS (
         f.egenkapital,
         f.aktiver,
         f.kortfristet_gaeld,
+        f.langfristet_gaeld,
         f.personaleomkostninger,
         f.egenkapital_primo,
         f.bruttoresultat,
@@ -1268,6 +1279,7 @@ SELECT
     personaleomkostninger, bruttoresultat, vareforbrug, afskrivninger,
     fin_indt, fin_udg, skat, udbytte,
     COALESCE(gaeld_tilknyttede_lt, 0) + COALESCE(gaeld_tilknyttede_st, 0) AS gaeld_tilknyttede,
+    gaeld_tilknyttede_lt, gaeld_tilknyttede_st, langfristet_gaeld,
     ebt, kassebeholdning, omloebsaktiver,
 
     -- Current ratio
@@ -1425,16 +1437,22 @@ def store(
 
 def export_excel() -> None:
     con = duckdb.connect(str(DB_PATH), read_only=True)
+    # Same universe as the dashboard: grid operators, retail utilities and
+    # other EXCLUDED_CVR entities stay in the DB but not in the report.
+    excluded = ", ".join(str(c) for c in sorted(EXCLUDED_CVR)) or "NULL"
+    con.execute(
+        f"CREATE TEMP VIEW kpis_export AS SELECT * FROM kpis WHERE cvr NOT IN ({excluded})"
+    )
 
     df_snap = con.execute("""
-        SELECT * FROM kpis
+        SELECT * FROM kpis_export
         WHERE regnskab_slut = (
-            SELECT MAX(k2.regnskab_slut) FROM kpis k2 WHERE k2.cvr = kpis.cvr
+            SELECT MAX(k2.regnskab_slut) FROM kpis_export k2 WHERE k2.cvr = kpis_export.cvr
         )
         ORDER BY omsaetning DESC NULLS LAST
     """).df()
 
-    df_ts = con.execute("SELECT * FROM kpis ORDER BY navn, regnskab_slut").df()
+    df_ts = con.execute("SELECT * FROM kpis_export ORDER BY navn, regnskab_slut").df()
 
     df_summary = con.execute("""
         SELECT
@@ -1445,30 +1463,39 @@ def export_excel() -> None:
             ROUND(AVG(net_margin_pct), 1)           AS avg_net_margin_pct,
             ROUND(MEDIAN(omsaetning_per_ansatte_tdkk), 0) AS median_omsaetning_per_ansatte_tdkk,
             ROUND(SUM(omsaetning) / 1e9, 2)         AS total_omsaetning_mia_dkk
-        FROM kpis
+        FROM kpis_export
         WHERE regnskab_slut = (
-            SELECT MAX(k2.regnskab_slut) FROM kpis k2 WHERE k2.cvr = kpis.cvr
+            SELECT MAX(k2.regnskab_slut) FROM kpis_export k2 WHERE k2.cvr = kpis_export.cvr
         )
         GROUP BY branche_tekst
         ORDER BY total_omsaetning_mia_dkk DESC NULLS LAST
     """).df()
 
     df_intraday_snap = con.execute("""
-        SELECT * FROM kpis
+        SELECT * FROM kpis_export
         WHERE is_intraday = TRUE
           AND regnskab_slut = (
-              SELECT MAX(k2.regnskab_slut) FROM kpis k2 WHERE k2.cvr = kpis.cvr
+              SELECT MAX(k2.regnskab_slut) FROM kpis_export k2 WHERE k2.cvr = kpis_export.cvr
           )
         ORDER BY omsaetning DESC NULLS LAST
     """).df()
 
     df_intraday_ts = con.execute("""
-        SELECT * FROM kpis
+        SELECT * FROM kpis_export
         WHERE is_intraday = TRUE
         ORDER BY navn, regnskab_slut
     """).df()
 
     con.close()
+
+    # Same fiscal-year attribution as the dashboard (skævt regnskabsår), so a
+    # 30 June 2024 close reads as FY 2023 in Excel too.
+    for frame in (df_snap, df_ts, df_intraday_snap, df_intraday_ts):
+        periods = list(zip(frame["regnskab_start"], frame["regnskab_slut"]))
+        pos = frame.columns.get_loc("regnskab_start") + 1
+        frame.insert(pos, "fiscal_year", [fy.fiscal_year(a, b) for a, b in periods])
+        frame.insert(pos + 1, "fy_label", [fy.fiscal_year_label(a, b) for a, b in periods])
+        frame.insert(pos + 2, "period_months", [fy.period_months(a, b) for a, b in periods])
 
     XLSX_PATH.parent.mkdir(parents=True, exist_ok=True)
     with pd.ExcelWriter(XLSX_PATH, engine="openpyxl") as writer:

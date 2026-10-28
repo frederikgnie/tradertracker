@@ -10,14 +10,26 @@ it moves its year-end). Both break the naive ``regnskab_slut.year`` split:
 * An 18-month first period is compared to 12-month periods as if it were one
   year, overstating every flow item by ~50%.
 
-Attribution rule (midpoint)
----------------------------
-A period belongs to the calendar year containing its midpoint — that is, the
-year in which most of the trading actually happened.
+Attribution rule (midpoint of the trailing twelve months)
+---------------------------------------------------------
+A period belongs to the calendar year containing the midpoint of the twelve
+months ending on its closing date — for a normal year, the year in which most
+of the trading actually happened. In practice: a close in January–June goes
+to the previous calendar year, a close in July–December to its own.
 
     1 Jul 2023 – 30 Jun 2024  → midpoint 30 Dec 2023 → 2023  ("2023/24")
     1 Oct 2023 – 30 Sep 2024  → midpoint 31 Mar 2024 → 2024  ("2023/24")
     1 Jan 2024 – 31 Dec 2024  → midpoint  1 Jul 2024 → 2024  ("2024")
+
+The closing date alone decides, not the period's own midpoint. A 30 June
+closer's year has its midpoint on 30/31 December, so any first-year stub or
+long first period nudged it across the boundary: an 11-month first period
+27 Jul 2023 – 30 Jun 2024 has its own midpoint in January 2024 and collided
+with the company's next full year (Jul 2024 – Jun 2025), which then hid it.
+Keying on the close keeps every period of one company on its own year grid,
+so consecutive filings land in consecutive years, and a short transition
+period after a year-end change shares a year with the full year it borders
+(and is superseded by it).
 
 This is deliberately not the Compustat convention (which assigns only
 January–May year-ends to the prior year, leaving June-enders on their end
@@ -124,17 +136,17 @@ def period_months(start: object, end: object) -> float | None:
 
 
 def fiscal_year(start: object, end: object) -> int | None:
-    """Calendar year containing the midpoint of the period.
+    """Calendar year containing the midpoint of the twelve months ending at ``end``.
 
     This is the year the filing should be compared against — see the module
-    docstring for why the midpoint and not the closing date.
+    docstring for why the trailing year and not the period's own midpoint.
+    ``start`` only validates the period; it does not move the year.
     """
     span = _span(start, end)
     if span is None:
         return None
-    start_date, end_date = span
-    midpoint = start_date + (end_date - start_date) / 2
-    return midpoint.year
+    end_date = span[1]
+    return end_date.year - 1 if end_date.month <= 6 else end_date.year
 
 
 def is_offset_year_end(end: object) -> bool:

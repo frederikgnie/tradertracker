@@ -145,6 +145,11 @@ METRICS: dict[str, dict] = {
         "fmt": ".1f",
         "help": "Return on Total Capital Deployed = net profit / opening (equity + related-party loans). Identical to ROOE for companies with no intercompany debt. More realistic for thinly-capitalised firms funded via shareholder loans — common for new ApS setups where the owner injects capital as a loan rather than formal equity.",
     },
+    "ROIC (%)": {
+        "col": "roic_pct",
+        "fmt": ".1f",
+        "help": "Return on Invested Capital = NOPAT / opening invested capital. NOPAT = EBIT × (1 − effective tax rate, 22% when it cannot be derived), so it is independent of how the firm is funded. Invested capital = equity + long-term liabilities + short-term related-party loans; filings do not separate bank debt from other liabilities, so this is a proxy. Cash is not netted off, because at a trading firm it is margin collateral (working capital). Use alongside ROTCD: ROTCD is the owners' return, ROIC the return on all long-term funding.",
+    },
     "Total Capital Deployed (DKK)": {
         "col": "total_capital_deployed",
         "fmt": ",.0f",
@@ -282,9 +287,13 @@ def load_data() -> pd.DataFrame:
     # A company changing its year-end files two periods that can land in the
     # same fiscal year (e.g. a 12-month Sep..Aug period plus a 4-month stub to
     # 31 December). Keep the longer — the one that actually represents the
-    # year — and flag the rest so they can be listed rather than vanish.
-    df = df.sort_values(["cvr", "year", "period_months"], ascending=[True, True, False])
+    # year — unless only the other one carries figures, and flag the rest so
+    # they can be listed rather than vanish.
+    df["_has_fin"] = df["omsaetning"].notna() | df["aarsresultat"].notna()
+    df = df.sort_values(["cvr", "year", "_has_fin", "period_months"],
+                        ascending=[True, True, False, False])
     df["fy_superseded"] = df.duplicated(subset=["cvr", "year"], keep="first")
+    df = df.drop(columns="_has_fin")
 
     # Derived metrics not in the SQL view
     # Use float NaN (not pd.NA) so .round() works on all pandas versions
@@ -301,7 +310,9 @@ def load_data() -> pd.DataFrame:
     # Flows are annualised first: an 18-month first period holds ~1.5 years of
     # revenue, so differencing it raw against a following 12-month year invents
     # a ~33% collapse that never happened. Growth is also suppressed across a
-    # gap in the fiscal-year sequence, where there is no true prior year.
+    # gap in the fiscal-year sequence, where there is no true prior year, and
+    # measured against the prior kept year — never a superseded transition
+    # stub, whose few months annualised say little about the year before.
     df = df.sort_values(["cvr", "regnskab_slut"])
     _annualise = pd.Series(
         [fy.annualisation_factor(a, b)
@@ -309,10 +320,11 @@ def load_data() -> pd.DataFrame:
         index=df.index,
     )
     df["omsaetning_annualiseret"] = df["omsaetning"] * _annualise
-    _prior_year = df.groupby("cvr")["year"].shift(1)
-    _consecutive = (df["year"] - _prior_year) == 1
+    _kept = df[~df["fy_superseded"]]
+    _prior_year = _kept.groupby("cvr")["year"].shift(1)
+    _consecutive = (_kept["year"] - _prior_year) == 1
     df["rev_growth_pct"] = (
-        df.groupby("cvr")["omsaetning_annualiseret"]
+        _kept.groupby("cvr")["omsaetning_annualiseret"]
         .pct_change()
         .where(_consecutive)
         .mul(100)
@@ -354,6 +366,27 @@ def load_data() -> pd.DataFrame:
     df["rotcd_pct"] = (df["aarsresultat"] / opening_total_capital.where(opening_total_capital >= 1e6) * 100).round(2)
     df["total_capital_deployed"] = df["egenkapital"] + df["gaeld_tilknyttede"]
 
+    # ROIC: NOPAT / opening invested capital. Filings do not split
+    # interest-bearing debt from other liabilities, so invested capital is
+    # equity + long-term liabilities + short-term related-party loans (the
+    # long-term related-party part already sits inside long-term liabilities).
+    # Cash is deliberately not netted off: at a trading firm it is margin and
+    # collateral, i.e. working capital, and netting it leaves about a quarter
+    # of the firms with zero or negative capital.
+    _lt = df[["langfristet_gaeld", "gaeld_tilknyttede_lt"]].fillna(0).max(axis=1)
+    _invested = df["egenkapital"] + _lt + df["gaeld_tilknyttede_st"].fillna(0)
+    _tax_rate = (
+        (df["skat"] / df["ebt"]).where((df["ebt"] > 0) & (df["skat"] >= 0))
+        .clip(0, 0.4).fillna(0.22)  # 22% = Danish corporate tax rate
+    )
+    _nopat = df["ebit"] * (1 - _tax_rate)
+    _opening_invested = (
+        _invested.groupby(df["cvr"]).shift(1)
+        .fillna(_invested - df["aarsresultat"])  # first year: capital before this year's profit
+    )
+    df["invested_capital"] = _invested
+    df["roic_pct"] = (_nopat / _opening_invested.where(_opening_invested >= 1e6) * 100).round(2)
+
     # TRADE: Gross Trading Profit / (Headcount × Opening Equity) × 100
     # Use bruttoresultat (gross profit line) when available — fixes gross-presenters like
     # Mind Energy whose omsaetning is full retail revenue, not the net trading margin.
@@ -368,6 +401,16 @@ def load_data() -> pd.DataFrame:
     # Suppress TRADE when deployed capital is near-zero — ratio is undefined for dormant firms.
     valid_deployed = deployed_capital.where(deployed_capital >= 1e6)
     df["trade_pct"] = (gross_trading_profit / (headcount * valid_deployed) * 100).round(2)
+
+    # Ratios of a flow to a stock or to headcount describe one year of
+    # activity. An 18-month first period would otherwise rank at ~1.5x its
+    # real ROE, a 6-month stub at half. Margins (flow/flow) need no scaling,
+    # and the factor is exactly 1.0 for every normal year.
+    for _col in ("roe_pct", "rooe_pct", "rotcd_pct", "roic_pct", "roa_pct", "roce_pct",
+                 "trade_pct", "aktiv_omsaetning", "omsaetning_per_ansatte_tdkk",
+                 "resultat_per_ansatte_tdkk", "personaleomkostninger_per_ansatte_tdkk"):
+        if _col in df.columns:
+            df[_col] = (df[_col] * _annualise).round(0 if _col.endswith("_tdkk") else 2)
 
     # Restructuring flag: years where no revenue is filed but a large profit/EBIT exists.
     # These are one-time disposal gains from mergers/wind-downs, not trading performance.
@@ -391,6 +434,20 @@ df_all = load_data()
 df_emp_monthly = load_employee_monthly()
 df_locations = load_company_locations()
 all_years = sorted(df_all["year"].dropna().unique().astype(int), reverse=True)
+
+# Default to the newest year that has most of the field reported. The newest
+# fiscal year fills in slowly — a lone transition stub or early filer can open
+# it months before anyone else — so showing it by default ranks a handful of
+# companies as if they were the market.
+_reported = (
+    df_all[~df_all["fy_superseded"]
+           & (df_all["omsaetning"].notna() | df_all["aarsresultat"].notna())]
+    .groupby("year")["cvr"].nunique()
+)
+default_year_idx = next(
+    (i for i, y in enumerate(all_years) if _reported.get(y, 0) >= 0.5 * _reported.max()),
+    0,
+) if len(_reported) else 0
 
 # ── Chart helpers ─────────────────────────────────────────────────────────────
 
@@ -473,7 +530,7 @@ with st.sidebar:
     selected_year = st.selectbox(
         "Financial year",
         options=all_years,
-        index=0,
+        index=default_year_idx,
         help=(
             "Fiscal years are attributed to the calendar year holding most of "
             "the period (the midpoint), not to the closing date. A company "
@@ -506,8 +563,9 @@ with st.sidebar:
             if len(_stub):
                 st.caption(
                     f"{len(_stub)} period(s) are not ~12 months (first-year stubs or "
-                    "year-end changes). Revenue growth is annualised for these; "
-                    "level figures are as filed."
+                    "year-end changes). Revenue growth, return ratios (ROE, ROOE, "
+                    "ROA, ROCE, TRADE) and per-employee figures are annualised "
+                    "for these; level figures are as filed."
                 )
 
     intraday_filter = st.radio(
@@ -725,8 +783,10 @@ st.markdown(
 
 # ── Tabs ───────────────────────────────────────────────────────────────────────
 
-tab_overview, tab_rankings, tab_timeseries, tab_headcount, tab_intraday, tab_sankey, tab_map, tab_table = st.tabs([
-    "Overview", "Rankings", "Time Series", "Headcount", "Pure Intraday", "Money Flow", "Map", "Data Table"
+(tab_overview, tab_rankings, tab_timeseries, tab_headcount, tab_intraday, tab_sankey,
+ tab_map, tab_table, tab_fy) = st.tabs([
+    "Overview", "Rankings", "Time Series", "Headcount", "Pure Intraday", "Money Flow",
+    "Map", "Data Table", "Fiscal Years",
 ])
 
 _COLOR_MAP = {True: "#f97316", False: "#3b82f6"}
@@ -872,14 +932,38 @@ with tab_timeseries:
         if df_plot.empty:
             st.warning("No data for the selected companies and metric.")
         else:
+            # Show which fiscal year each point really is: the period label
+            # ("2023/24") and dates in the hover, and a marker shape for
+            # skævt regnskabsår and stub / long periods.
+            df_plot = df_plot.assign(
+                _from=pd.to_datetime(df_plot["fy_start"]).dt.strftime("%d %b %Y"),
+                _to=pd.to_datetime(df_plot["regnskab_slut"]).dt.strftime("%d %b %Y"),
+            )
             fig = px.line(
                 df_plot,
                 x="year",
                 y=ts_col,
                 color="navn",
                 markers=True,
-                labels={"year": "Year", ts_col: ts_metric_display, "navn": "Company"},
+                hover_data={"fy_label": True, "_from": True, "_to": True,
+                            "period_months": True},
+                labels={"year": "Fiscal year", ts_col: ts_metric_display, "navn": "Company",
+                        "fy_label": "Period", "_from": "From", "_to": "To",
+                        "period_months": "Months"},
                 title=f"{ts_metric_display} over time",
+            )
+            for _trace in fig.data:
+                _rows = df_plot[df_plot["navn"] == _trace.name]
+                _trace.marker.symbol = [
+                    "diamond-open" if not annual else ("square" if offset else "circle")
+                    for annual, offset in zip(_rows["is_annual_period"], _rows["is_offset_fy"])
+                ]
+                _trace.marker.size = 9
+            fig.update_xaxes(dtick=1, tickformat="d")
+            st.caption(
+                "● calendar year · ■ skævt regnskabsår (shown under the year holding "
+                "most of its trading) · ◇ stub or long period, annualised for ratios. "
+                "Hover a point for its exact period."
             )
             if df_plot[ts_col].min() < 0 or ts_meta.get("can_be_negative", True):
                 fig.add_hline(
@@ -1550,7 +1634,7 @@ with tab_map:
             "Other":              "#6b7280",
         }
 
-        fig_map = px.scatter_mapbox(
+        fig_map = px.scatter_map(
             map_df,
             lat="lat",
             lon="lon",
@@ -1568,7 +1652,7 @@ with tab_map:
             },
             zoom=6,
             center={"lat": 56.27, "lon": 10.60},
-            mapbox_style="open-street-map",
+            map_style="open-street-map",
             height=700,
         )
         fig_map.update_traces(marker=dict(size=10, opacity=0.85))
@@ -1583,3 +1667,99 @@ with tab_map:
             "seeded from company names — run `python geocode_companies.py` for exact addresses "
             "once cvrapi.dk quota resets (June 1)."
         )
+
+
+# ─── Tab: Fiscal Years ────────────────────────────────────────────────────────
+
+with tab_fy:
+    st.caption(
+        "Every filed period on a calendar axis, coloured by the fiscal year it is "
+        "counted in. Bars crossing a 1 January line are skævt regnskabsår; short "
+        "bars are first-year stubs or year-end changes. Faded bars are transition "
+        "periods superseded by a full year in the same fiscal year."
+    )
+
+    _fy = _apply_category(df_all).copy()
+    _fy["Status"] = _fy["fy_superseded"].map(
+        {False: "Counted", True: "Superseded (transition period)"})
+    _fy["From"] = pd.to_datetime(_fy["fy_start"])
+    # Closing dates are inclusive; draw the bar to the end of that day.
+    _fy["To"] = pd.to_datetime(_fy["regnskab_slut"]) + pd.Timedelta(days=1)
+    _fy["Fiscal year"] = _fy["year"].astype(str)
+    _fy["Months"] = _fy["period_months"]
+
+    _c1, _c2 = st.columns([2, 3])
+    with _c1:
+        _only_offset = st.toggle(
+            "Only companies with an offset year-end or a non-12-month period",
+            value=True,
+        )
+    with _c2:
+        _yr_min, _yr_max = int(_fy["year"].min()), int(_fy["year"].max())
+        _yr_from, _yr_to = st.slider(
+            "Fiscal years", _yr_min, _yr_max,
+            (max(_yr_min, _yr_max - 4), _yr_max),
+        )
+    _fy = _fy[_fy["year"].between(_yr_from, _yr_to)]
+    if _only_offset:
+        _odd = _fy.groupby("cvr")[["is_offset_fy", "is_annual_period"]].agg(
+            {"is_offset_fy": "any", "is_annual_period": "all"})
+        _keep = _odd.index[_odd["is_offset_fy"] | ~_odd["is_annual_period"]]
+        _fy = _fy[_fy["cvr"].isin(_keep)]
+
+    if _fy.empty:
+        st.info("No filings match the current filters.")
+    else:
+        # Order companies by their typical closing month, then name, so June
+        # closers, September closers and calendar filers form visible blocks.
+        _close = _fy.groupby("navn")["fy_end_month"].agg(lambda s: s.mode().iloc[0])
+        _order = sorted(_close.index, key=lambda n: (_close[n], n))
+        _years_sorted = sorted(_fy["Fiscal year"].unique())
+        fig_fy = px.timeline(
+            _fy.sort_values("From"),
+            x_start="From", x_end="To", y="navn",
+            color="Fiscal year",
+            pattern_shape="Status",
+            pattern_shape_map={"Counted": "", "Superseded (transition period)": "/"},
+            category_orders={"navn": _order, "Fiscal year": _years_sorted},
+            color_discrete_sequence=px.colors.qualitative.Safe,
+            hover_data={"fy_label": True, "Months": True, "Status": True,
+                        "From": "|%d %b %Y", "To": False, "regnskab_slut": True,
+                        "Fiscal year": True, "navn": False},
+            labels={"navn": "", "fy_label": "Period label",
+                    "regnskab_slut": "Closes"},
+            height=max(320, 24 * len(_order) + 140),
+        )
+        fig_fy.update_traces(
+            selector=lambda t: "Superseded" in (t.name or ""), opacity=0.45)
+        for _y in range(_yr_from, _yr_to + 3):
+            fig_fy.add_shape(
+                type="line", xref="x", yref="paper",
+                x0=f"{_y}-01-01", x1=f"{_y}-01-01", y0=0, y1=1,
+                line={"color": "rgba(128,128,128,0.45)", "width": 1, "dash": "dot"},
+            )
+        fig_fy.update_layout(
+            legend={"orientation": "h", "yanchor": "bottom", "y": 1.0,
+                    "xanchor": "left", "x": 0, "title_text": "Counted in FY:"},
+            margin={"l": 10, "r": 10, "t": 110, "b": 10},
+            xaxis_title=None,
+        )
+        st.plotly_chart(fig_fy, width="stretch")
+
+        # Where do the books close? One bar per closing month, counted filings.
+        _months = (
+            _apply_category(df_all)[lambda d: d["year"].between(_yr_from, _yr_to)
+                                    & ~d["fy_superseded"]]
+            .assign(Close=lambda d: pd.to_datetime(d["regnskab_slut"]).dt.strftime("%b"),
+                    m=lambda d: d["fy_end_month"])
+            .groupby(["m", "Close"]).size().reset_index(name="Filings")
+            .sort_values("m")
+        )
+        fig_months = px.bar(
+            _months, x="Close", y="Filings", text="Filings",
+            title=f"Closing month of counted filings, FY {_yr_from}–{_yr_to}",
+            height=300,
+        )
+        fig_months.update_traces(marker_color="#3b82f6", textposition="outside")
+        fig_months.update_layout(xaxis_title=None, margin={"l": 10, "r": 10, "t": 50, "b": 10})
+        st.plotly_chart(fig_months, width="stretch")
