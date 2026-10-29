@@ -932,24 +932,29 @@ with tab_timeseries:
         if df_plot.empty:
             st.warning("No data for the selected companies and metric.")
         else:
-            # Show which fiscal year each point really is: the period label
-            # ("2023/24") and dates in the hover, and a marker shape for
-            # skævt regnskabsår and stub / long periods.
+            # Each point sits at the middle of its own accounting period on a
+            # real date axis, so a 30 June closer plots around New Year, a
+            # September closer around April and a stub inside its few months —
+            # the timing is shown, not attributed. The year slider still
+            # filters by fiscal year (see fiscalyear.py).
+            _start = pd.to_datetime(df_plot["fy_start"])
+            _end = pd.to_datetime(df_plot["regnskab_slut"])
             df_plot = df_plot.assign(
-                _from=pd.to_datetime(df_plot["fy_start"]).dt.strftime("%d %b %Y"),
-                _to=pd.to_datetime(df_plot["regnskab_slut"]).dt.strftime("%d %b %Y"),
-            )
+                _mid=_start + (_end - _start) / 2,
+                _from=_start.dt.strftime("%d %b %Y"),
+                _to=_end.dt.strftime("%d %b %Y"),
+            ).sort_values(["navn", "_mid"])
             fig = px.line(
                 df_plot,
-                x="year",
+                x="_mid",
                 y=ts_col,
                 color="navn",
                 markers=True,
-                hover_data={"fy_label": True, "_from": True, "_to": True,
-                            "period_months": True},
-                labels={"year": "Fiscal year", ts_col: ts_metric_display, "navn": "Company",
-                        "fy_label": "Period", "_from": "From", "_to": "To",
-                        "period_months": "Months"},
+                hover_data={"_mid": False, "year": True, "fy_label": True,
+                            "_from": True, "_to": True, "period_months": True},
+                labels={"_mid": "Middle of accounting period", ts_col: ts_metric_display,
+                        "navn": "Company", "year": "Fiscal year", "fy_label": "Period",
+                        "_from": "From", "_to": "To", "period_months": "Months"},
                 title=f"{ts_metric_display} over time",
             )
             for _trace in fig.data:
@@ -959,11 +964,14 @@ with tab_timeseries:
                     for annual, offset in zip(_rows["is_annual_period"], _rows["is_offset_fy"])
                 ]
                 _trace.marker.size = 9
-            fig.update_xaxes(dtick=1, tickformat="d")
+            # Grid lines on 1 January, year labels centred on each calendar year.
+            fig.update_xaxes(dtick="M12", tick0="2000-01-01", tickformat="%Y",
+                             ticklabelmode="period", showgrid=True)
             st.caption(
-                "● calendar year · ■ skævt regnskabsår (shown under the year holding "
-                "most of its trading) · ◇ stub or long period, annualised for ratios. "
-                "Hover a point for its exact period."
+                "Each point is placed at the middle of its accounting period: "
+                "● calendar year (mid-year) · ■ skævt regnskabsår (off-centre, e.g. a "
+                "30 June close sits at New Year) · ◇ stub or long period, annualised "
+                "for ratios. Hover a point for its exact period."
             )
             if df_plot[ts_col].min() < 0 or ts_meta.get("can_be_negative", True):
                 fig.add_hline(
