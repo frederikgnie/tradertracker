@@ -17,7 +17,7 @@ Usage:
 
 import argparse
 import io
-import json
+import math
 import os
 import sys
 from datetime import date, datetime, timedelta
@@ -574,10 +574,12 @@ _NONCURRENT_LIAB = [
 _RELATED_PARTY_DEBT_LT = [
     "fsa:LongtermPayablesToGroupEnterprises",           # gæld til tilknyttede virksomheder (langfristet)
     "fsa:LongtermPayablesToShareholdersAndManagement",  # gæld til kapitalejere/ledelse (langfristet)
+    "ifrs-full:NoncurrentPayablesToRelatedParties",    # IFRS equivalent, so both GAAPs count alike
 ]
 _RELATED_PARTY_DEBT_ST = [
     "fsa:ShorttermPayablesToGroupEnterprises",          # gæld til tilknyttede virksomheder (kortfristet)
     "fsa:ShorttermPayablesToShareholdersAndManagement", # gæld til kapitalejere/ledelse (kortfristet)
+    "ifrs-full:TradeAndOtherCurrentPayablesToRelatedParties",  # IFRS equivalent
 ]
 _EBT = [
     "fsa:ProfitLossFromOrdinaryActivitiesBeforeTax",   # Danish GAAP pre-tax profit
@@ -653,6 +655,85 @@ _DIVIDENDS = [
     "ifrs-full:DividendsPaid",
     "ifrs-full:DividendsPaidClassifiedAsFinancingActivities",  # IFRS cash-flow statement (e.g. Danske Commodities 11B in 2023)
     "ifrs-full:DividendsPaidToEquityHoldersOfParentClassifiedAsFinancingActivities",  # IFRS when broken out by holder type
+]
+
+# Balance-sheet detail for working capital and invested capital. Concept
+# names are the ones the tracked companies actually tag (scan of their latest
+# filings, Oct 2026). A line a filer omits is zero in practice: Danish
+# filings do not tag empty balance-sheet lines.
+_NONCURRENT_ASSETS = [
+    "fsa:NoncurrentAssets",
+    "ifrs-full:NoncurrentAssets",
+]
+_TOTAL_LIABILITIES = [
+    "fsa:LiabilitiesOtherThanProvisions",   # gældsforpligtelser i alt
+    "ifrs-full:Liabilities",                # IFRS: includes provisions
+]
+_PROVISIONS = [
+    "fsa:Provisions",                       # hensatte forpligtelser i alt
+    "ifrs-full:Provisions",
+]
+_RECEIVABLES = [
+    "fsa:ShorttermReceivables",             # tilgodehavender i alt
+    "ifrs-full:TradeAndOtherCurrentReceivables",
+    "ifrs-full:CurrentTradeReceivables",
+]
+_RELATED_PARTY_RECEIVABLES_ST = [           # summed: disjoint lines
+    "fsa:ShorttermReceivablesFromGroupEnterprises",
+    "ifrs-full:TradeAndOtherCurrentReceivablesDueFromRelatedParties",
+]
+_INVENTORIES = [
+    "fsa:Inventories",
+    "ifrs-full:Inventories",
+]
+# Lines that are summed are listed as groups: (total, *parts). A group
+# counts its total when the filing tags it, else the sum of its parts, so a
+# filer that tags both a subtotal and its breakdown is not counted twice
+# (seen: ShorttermInvestments = OtherShorttermInvestments in 4 filings).
+_CURRENT_SECURITIES: list[tuple[str, ...]] = [
+    ("fsa:ShorttermInvestments", "fsa:OtherShorttermInvestments"),  # værdipapirer og kapitalandele
+    ("ifrs-full:CurrentInvestments",),
+    ("ifrs-full:ShorttermDepositsNotClassifiedAsCashEquivalents",),
+]
+_TRADE_PAYABLES = [
+    "fsa:ShorttermTradePayables",           # leverandører af varer og tjenesteydelser
+    "ifrs-full:TradeAndOtherCurrentPayablesToTradeSuppliers",
+    "ifrs-full:CurrentTradePayables",
+]
+# Interest-bearing debt to third parties (related-party loans are separate).
+# Lease liabilities count under IFRS 16 — tagged as lines of their own next
+# to borrowings (different values in all 9 filings tagging both); Danish-GAAP
+# lease *commitments* are off-balance notes and do not.
+_BANK_DEBT_ST: list[tuple[str, ...]] = [
+    ("fsa:ShorttermDebtToCreditInstitutions",
+     "fsa:ShorttermDebtToBanks", "fsa:ShorttermDebtToOtherCreditInstitutions"),
+    ("fsa:ShorttermMortgageDebt",),
+    # Kortfristet del af langfristet gæld: the current portion of bank and
+    # mortgage loans, the fsa counterpart of CurrentPortionOfLongtermBorrowings.
+    ("fsa:ShorttermPartOfLongtermLiabilitiesOtherThanProvisions",),
+    ("ifrs-full:ShorttermBorrowings",),
+    ("ifrs-full:CurrentPortionOfLongtermBorrowings",),
+    ("ifrs-full:CurrentLeaseLiabilities",),
+]
+_BANK_DEBT_LT: list[tuple[str, ...]] = [
+    ("fsa:LongtermDebtToCreditInstitutions",
+     "fsa:LongtermDebtToBanks", "fsa:LongtermDebtToOtherCreditInstitutions"),
+    ("fsa:LongtermMortgageDebt",),
+    ("ifrs-full:LongtermBorrowings",),
+    ("ifrs-full:NoncurrentLeaseLiabilities",),
+]
+_DERIVATIVE_ASSETS = [                      # summed: current + non-current
+    "fsa:DerivativeFinancialInstrumentsShorttermAssets",
+    "fsa:DerivativeFinancialInstrumentsLongtermAssets",
+    "ifrs-full:CurrentDerivativeFinancialAssets",
+    "ifrs-full:NoncurrentDerivativeFinancialAssets",
+]
+_DERIVATIVE_LIABILITIES = [                 # summed: current + non-current
+    "fsa:ShortermDerivativeFinancialInstrumentsLiabilities",  # sic: the taxonomy's spelling
+    "fsa:DerivativeFinancialInstrumentsShorttermLiabilities",
+    "fsa:DerivativeFinancialInstrumentsLongtermLiabilities",
+    "ifrs-full:CurrentDerivativeFinancialLiabilities",
+    "ifrs-full:NoncurrentDerivativeFinancialLiabilities",
 ]
 
 # Namespace -> concept prefix mapping for standard XBRL element tag resolution
@@ -888,12 +969,85 @@ _IX = "http://www.xbrl.org/2013/inlineXBRL"
 # Fixed EUR->DKK rate used to normalise companies that report in EUR
 EUR_DKK = 7.46
 
+# The one kind of axis that does not break a total down: it only says whose
+# statements a fact belongs to — the group's or the parent company's alone.
+# The two taxonomies tag it the opposite way round: IFRS/ESEF leaves the
+# group without a dimension and marks the parent SeparateMember, Danish GAAP
+# leaves the parent without one and marks the group ConsolidatedMember. The
+# group is the trading business, so it wins either way: consolidated (0),
+# then no dimension (1), then parent-only (2). Lower rank wins.
+_ENTITY_SCOPE_AXES = frozenset({
+    "ConsolidatedAndSeparateFinancialStatementsAxis",  # ifrs-full
+    "ConsolidatedSoloDimension",                       # cmn (Danish GAAP)
+})
+_ENTITY_SCOPE_RANK = {"ConsolidatedMember": 0, "SeparateMember": 2, "SoloMember": 2}
+_NO_DIMENSION_RANK = 1
+#: Balance-sheet totals every filing tags; their best rank sets the filing's scope.
+_SCOPE_CONCEPTS = frozenset({"fsa:Assets", "fsa:Equity", "ifrs-full:Assets", "ifrs-full:Equity"})
 
-def _parse_xbrl_facts(xml_bytes: bytes) -> dict[str, dict[str, int]]:
+#: Rank of a context carrying any other dimension: a breakdown (an equity
+#: component, a segment, a five-year-summary column holding last year's
+#: figure under this year's dates), used only for a concept/period with no
+#: total at all (some filers tag headcount so).
+DIMENSIONAL_RANK = 3
+
+
+def _context_rank(ctx: ET.Element) -> int:
+    """0 consolidated, 1 no dimension, 2 parent-only, DIMENSIONAL_RANK otherwise."""
+    rank = _NO_DIMENSION_RANK
+    for tag in (f"{{{_XBRLI}}}segment", f"{{{_XBRLI}}}scenario"):
+        for container in ctx.iter(tag):
+            for member in container:
+                axis = member.get("dimension", "").split(":")[-1]
+                if axis not in _ENTITY_SCOPE_AXES:
+                    return DIMENSIONAL_RANK
+                member_rank = _ENTITY_SCOPE_RANK.get((member.text or "").strip().split(":")[-1])
+                if member_rank is None:
+                    return DIMENSIONAL_RANK
+                rank = member_rank
+    return rank
+
+
+def _plain_number(text: str) -> float | None:
+    """Parse a canonical XBRL number ("-1234567", "1234.5"); None if it is not one."""
+    try:
+        value = float(text.strip())
+    except ValueError:
+        return None
+    return value if math.isfinite(value) else None
+
+
+def _ix_number(text: str, fmt: str) -> float | None:
+    """Parse a displayed inline-XBRL number according to its ixt format.
+
+    Danish reports mostly use ixt:num-comma-decimal: "1.063.876" is a million,
+    "97,6" is ninety-seven point six. Stripping only commas used to drop every
+    such value of a thousand or more and keep the zeros, so whole IFRS
+    filings parsed as equity 0 and profit 0.
+    """
+    s = text.strip().replace("\xa0", "").replace(" ", "").replace("'", "")
+    if s in ("-", "–", "—"):  # ixt:fixed-zero / zerodash render nil as a dash
+        return 0.0
+    if not s:
+        return None
+    style = fmt.split(":")[-1].replace("-", "").lower()
+    if style in ("numcommadecimal", "numdotcomma", "numspacecomma", "numcomma"):
+        s = s.replace(".", "").replace(",", ".")
+    else:  # num-dot-decimal or unformatted: commas group thousands
+        s = s.replace(",", "")
+    return _plain_number(s)
+
+
+def _parse_xbrl_facts(
+    xml_bytes: bytes, ranks_out: dict[tuple[str, str], int] | None = None
+) -> dict[str, dict[str, int]]:
     """
     Return {concept_name: {period_end_date: best_value}} with all monetary
     values normalised to DKK.  EUR amounts are converted at EUR_DKK.
     Non-monetary units (shares, ratios) are ignored.
+
+    ranks_out, if given, receives the context rank of every kept fact, keyed
+    by (concept, period_end) — DIMENSIONAL_RANK marks a breakdown, not a total.
     """
     root = ET.fromstring(xml_bytes)
 
@@ -912,16 +1066,26 @@ def _parse_xbrl_facts(xml_bytes: bytes) -> dict[str, dict[str, int]]:
         prefix, local = name.split(":", 1)
         return f"{doc_prefix_to_std.get(prefix, prefix)}:{local}"
 
-    # Build context -> period-end date
-    ctx_date: dict[str, str] = {}
+    # Build context -> (period-end date, rank); see _context_rank.
+    # A context with a dimension member is one column of the equity statement
+    # (share capital, retained earnings), one segment or a five-year-summary
+    # column. The XBRL Dimensions spec forbids the default member in a
+    # context, so a statement total is tagged without one. Reading
+    # dimensional facts let "first occurrence wins" pick e.g. retained
+    # earnings as total equity, or last year's revenue from the five-year
+    # summary, whenever those preceded the statements — plain-XML filings are
+    # in no particular order. The one exception is the group/parent axis.
+    ctx_date: dict[str, tuple[str, int]] = {}
     for ctx in root.iter(f"{{{_XBRLI}}}context"):
         ctx_id = ctx.get("id", "")
+        rank = _context_rank(ctx)
         period = ctx.find(f"{{{_XBRLI}}}period")
         if period is None:
             continue
         end = period.findtext(f"{{{_XBRLI}}}endDate")
         instant = period.findtext(f"{{{_XBRLI}}}instant")
-        ctx_date[ctx_id] = end or instant or ""
+        if end or instant:
+            ctx_date[ctx_id] = (end or instant or "", rank)
 
     # Build unit ID -> ISO currency code (e.g. "DKK", "EUR")
     unit_currency: dict[str, str] = {}
@@ -954,30 +1118,30 @@ def _parse_xbrl_facts(xml_bytes: bytes) -> dict[str, dict[str, int]]:
         "ifrs-full:NumberOfEmployees",
     })
 
-    def _record(name: str, ctx: str, unit: str, raw_text: str, scale: int = 0) -> None:
-        raw = raw_text.strip().replace(",", "").replace("\xa0", "").replace(" ", "")
-        if not unit or not raw or not raw.lstrip("-").isdigit():
+    # Every candidate value, by rank, first occurrence within a rank: a
+    # repeat of (concept, period, rank) is the same total shown twice (profit
+    # in the income statement and the equity statement) or a period-end
+    # shared by an instant and a duration context.
+    candidates: dict[tuple[str, str], dict[int, int]] = {}
+
+    def _record(name: str, ctx: str, unit: str, number: float | None, scale: int = 0) -> None:
+        if not unit or number is None:
             return
-        period_end = ctx_date.get(ctx, "")
+        period_end, rank = ctx_date.get(ctx, ("", DIMENSIONAL_RANK))
         if not period_end:
             return
         if name in _EMPLOYEE_CONCEPTS:
             # Headcount: accept any unit (xbrli:pure, xbrli:shares, etc.), no currency conversion.
             # Scale is intentionally ignored — employee counts are raw integers; scale=3 on a
             # headcount element is an XBRL authoring error (monetary table scale applied to count).
-            value = int(raw)
+            value = round(number)
         else:
             currency = _resolve_currency(unit)
             if currency not in ("DKK", "EUR"):
                 return  # skip shares, ratios, etc.
-            base_value = int(raw) * (10 ** scale)
-            value = round(base_value * EUR_DKK) if currency == "EUR" else base_value
-        if name not in facts:
-            facts[name] = {}
-        # First occurrence wins: income statement values precede equity-movement tables
-        # in XBRL documents, so the first value for a (concept, period) pair is correct.
-        if period_end not in facts[name]:
-            facts[name][period_end] = value
+            base_value = number * (10 ** scale)
+            value = round(base_value * EUR_DKK) if currency == "EUR" else round(base_value)
+        candidates.setdefault((name, period_end), {}).setdefault(rank, value)
 
     # --- Inline XBRL (ix:nonFraction) — used by IFRS filers and newer reports ---
     ix_count = 0
@@ -985,15 +1149,14 @@ def _parse_xbrl_facts(xml_bytes: bytes) -> dict[str, dict[str, int]]:
         ix_count += 1
         scale_s = elem.get("scale", "0")
         scale = int(scale_s) if scale_s.lstrip("-").isdigit() else 0
-        text = elem.text or ""
-        if elem.get("sign") == "-":
-            text = text.strip()
-            text = text[1:] if text.startswith("-") else ("-" + text if text else text)
+        number = _ix_number("".join(elem.itertext()), elem.get("format", ""))
+        if number is not None and elem.get("sign") == "-":
+            number = -number
         _record(
             _normalize_concept(elem.get("name", "")),
             elem.get("contextRef", ""),
             elem.get("unitRef", ""),
-            text,
+            number,
             scale,
         )
 
@@ -1004,7 +1167,33 @@ def _parse_xbrl_facts(xml_bytes: bytes) -> dict[str, dict[str, int]]:
             unit = elem.get("unitRef")
             if not ctx or not unit:
                 continue
-            _record(_elem_concept(elem.tag), ctx, unit, elem.text or "")
+            _record(_elem_concept(elem.tag), ctx, unit, _plain_number(elem.text or ""))
+
+    # Resolve the filing's scope once — group or parent company — from the
+    # best-ranked balance-sheet total, and read every concept in that scope.
+    # Per concept, a Danish group filing would take group equity (tagged
+    # ConsolidatedMember) next to parent-only intercompany loans (tagged
+    # without a dimension, eliminated in the group): a line the chosen
+    # statements do not show is absent, not borrowed from the other entity.
+    scope_ranks = [
+        rank
+        for (name, _), by_rank in candidates.items() if name in _SCOPE_CONCEPTS
+        for rank in by_rank if rank < DIMENSIONAL_RANK
+    ]
+    scope = min(scope_ranks) if scope_ranks else _NO_DIMENSION_RANK
+    fact_rank: dict[tuple[str, str], int] = {} if ranks_out is None else ranks_out
+    for (name, period_end), by_rank in candidates.items():
+        entity_ranks = [r for r in by_rank if r < DIMENSIONAL_RANK]
+        if scope in by_rank:
+            rank = scope
+        elif entity_ranks and name not in _EMPLOYEE_CONCEPTS:
+            continue  # only in the other entity's statements
+        else:
+            # Headcount (often tagged once for the whole report) or a
+            # concept with no total at all: best rank available.
+            rank = min(by_rank)
+        fact_rank[(name, period_end)] = rank
+        facts.setdefault(name, {})[period_end] = by_rank[rank]
 
     return facts
 
@@ -1030,6 +1219,30 @@ def _sum_facts(facts: dict, period_end: str, *concepts: str) -> float | None:
             total += float(v)
             found = True
     return total if found else None
+
+
+def _sum_groups(facts: dict, period_end: str, groups: list[tuple[str, ...]]) -> float | None:
+    """Sum of line groups: each group's total if tagged, else its parts' sum.
+    Returns None if no concept of any group has data."""
+    total, found = 0.0, False
+    for total_concept, *parts in groups:
+        v = _pick_fact(facts, period_end, total_concept)
+        if v is None and parts:
+            v = _sum_facts(facts, period_end, *parts)
+        if v is not None:
+            total += v
+            found = True
+    return total if found else None
+
+
+def _opening_sum(
+    facts: dict, open_date: str | None, has_opening: bool, groups: list[tuple[str, ...]]
+) -> float | None:
+    """Sum of an opening balance; zero when the opening balance sheet is tagged
+    but the line is not (Danish filings omit empty lines), None without one."""
+    if not has_opening or open_date is None:
+        return None
+    return _sum_groups(facts, open_date, groups) or 0.0
 
 
 VIRK_ES = "http://distribution.virk.dk/offentliggoerelser/_search"
@@ -1066,12 +1279,16 @@ def check_watchlist() -> None:
 
 
 def fetch_and_parse_financials(
-    cvr: int, skip_periods: set[str] | None = None
+    cvr: int,
+    skip_periods: set[str] | None = None,
+    facts_out: list[dict] | None = None,
 ) -> list[dict]:
     """Fetch annual reports for a CVR and parse XBRL financials.
 
     skip_periods: period-end dates (YYYY-MM-DD) already in the DB — their
     XBRL documents are not re-downloaded, making incremental runs fast.
+    facts_out: if given, receives one row per total tagged in each parsed
+    filing (rows for the xbrl_facts table).
     """
     try:
         recs = _get("api/cvr/regnskab", {"cvr_nummer": cvr})
@@ -1129,7 +1346,8 @@ def fetch_and_parse_financials(
         try:
             rx = httpx.get(doc_url, timeout=60, follow_redirects=True)
             rx.raise_for_status()
-            facts = _parse_xbrl_facts(rx.content)
+            ranks: dict[tuple[str, str], int] = {}
+            facts = _parse_xbrl_facts(rx.content, ranks_out=ranks)
         except Exception:
             continue
 
@@ -1146,6 +1364,8 @@ def fetch_and_parse_financials(
         else:
             open_date = None
         egenkapital_primo = _pick_fact(facts, open_date, *_EQUITY) if open_date else None
+
+        has_opening = egenkapital_primo is not None and open_date is not None
 
         rows.append(
             {
@@ -1175,8 +1395,36 @@ def fetch_and_parse_financials(
                 "ebt":                  _pick_fact(facts, period_end, *_EBT),
                 "kassebeholdning":      _pick_fact(facts, period_end, *_CASH),
                 "omloebsaktiver":       _pick_fact(facts, period_end, *_CURRENT_ASSETS),
+                "anlaegsaktiver":       _pick_fact(facts, period_end, *_NONCURRENT_ASSETS),
+                "gaeld_i_alt":          _pick_fact(facts, period_end, *_TOTAL_LIABILITIES),
+                "hensatte_forpligtelser": _pick_fact(facts, period_end, *_PROVISIONS),
+                "tilgodehavender":      _pick_fact(facts, period_end, *_RECEIVABLES),
+                "tilgodehavender_tilknyttede": _sum_facts(facts, period_end, *_RELATED_PARTY_RECEIVABLES_ST),
+                "varebeholdninger":     _pick_fact(facts, period_end, *_INVENTORIES),
+                "vaerdipapirer":        _sum_groups(facts, period_end, _CURRENT_SECURITIES),
+                "leverandoergaeld":     _pick_fact(facts, period_end, *_TRADE_PAYABLES),
+                "bankgaeld_st":         _sum_groups(facts, period_end, _BANK_DEBT_ST),
+                "bankgaeld_lt":         _sum_groups(facts, period_end, _BANK_DEBT_LT),
+                "derivater_aktiver":    _sum_facts(facts, period_end, *_DERIVATIVE_ASSETS),
+                "derivater_passiver":   _sum_facts(facts, period_end, *_DERIVATIVE_LIABILITIES),
+                # Opening loans and bank debt from the comparative column.
+                "gaeld_tilknyttede_primo": _opening_sum(
+                    facts, open_date, has_opening,
+                    [(c,) for c in (*_RELATED_PARTY_DEBT_LT, *_RELATED_PARTY_DEBT_ST)]),
+                "bankgaeld_primo":      _opening_sum(
+                    facts, open_date, has_opening, [*_BANK_DEBT_ST, *_BANK_DEBT_LT]),
             }
         )
+        if facts_out is not None:
+            # Every total in the filing, current year and comparatives, so a
+            # new KPI can be derived later without downloading XBRL again.
+            facts_out.extend(
+                {"cvr": cvr, "regnskab_slut": period_end, "concept": concept,
+                 "period_end": fact_end, "value": float(value)}
+                for concept, by_end in facts.items()
+                for fact_end, value in by_end.items()
+                if ranks.get((concept, fact_end), 0) < DIMENSIONAL_RANK
+            )
 
     return rows
 
@@ -1228,6 +1476,15 @@ CREATE TABLE IF NOT EXISTS financials (
     kassebeholdning        DOUBLE,
     omloebsaktiver         DOUBLE,
     PRIMARY KEY (cvr, regnskab_slut)
+);
+-- Every total tagged in each parsed filing (current year and comparatives),
+-- keyed by the filing it came from. Lets new KPIs be derived without a refetch.
+CREATE TABLE IF NOT EXISTS xbrl_facts (
+    cvr            INTEGER,
+    regnskab_slut  DATE,
+    concept        VARCHAR,
+    period_end     DATE,
+    value          DOUBLE
 );
 CREATE TABLE IF NOT EXISTS company_locations (
     cvr     INTEGER PRIMARY KEY,
@@ -1284,6 +1541,20 @@ WITH base AS (
         f.ebt,
         f.kassebeholdning,
         f.omloebsaktiver,
+        f.anlaegsaktiver,
+        f.gaeld_i_alt,
+        f.hensatte_forpligtelser,
+        f.tilgodehavender,
+        f.tilgodehavender_tilknyttede,
+        f.varebeholdninger,
+        f.vaerdipapirer,
+        f.leverandoergaeld,
+        f.bankgaeld_st,
+        f.bankgaeld_lt,
+        f.derivater_aktiver,
+        f.derivater_passiver,
+        f.gaeld_tilknyttede_primo,
+        f.bankgaeld_primo,
         COALESCE(
             CAST(f.ansatte_regnskab AS INTEGER),
             (SELECT CAST(ROUND(AVG(e.antal_ansatte)) AS INTEGER)
@@ -1307,6 +1578,44 @@ SELECT
     COALESCE(gaeld_tilknyttede_lt, 0) + COALESCE(gaeld_tilknyttede_st, 0) AS gaeld_tilknyttede,
     gaeld_tilknyttede_lt, gaeld_tilknyttede_st, langfristet_gaeld,
     ebt, kassebeholdning, omloebsaktiver,
+    anlaegsaktiver, gaeld_i_alt, hensatte_forpligtelser, tilgodehavender,
+    tilgodehavender_tilknyttede, varebeholdninger, vaerdipapirer, leverandoergaeld,
+    bankgaeld_st, bankgaeld_lt, derivater_aktiver, derivater_passiver,
+    gaeld_tilknyttede_primo, bankgaeld_primo,
+
+    -- ── Capital measures ────────────────────────────────────────────────
+    -- A balance-sheet line a filer omits is zero in practice (Danish filings
+    -- do not tag empty lines), so the components are COALESCEd, but only
+    -- for filings that report a balance sheet at all (equity present).
+
+    -- Interest-bearing debt: banks, credit institutions, mortgages, IFRS 16
+    -- leases, plus related-party / shareholder loans — at owner-funded
+    -- trading firms those loans are how the capital comes in.
+    CASE WHEN egenkapital IS NOT NULL THEN
+        COALESCE(bankgaeld_st, 0) + COALESCE(bankgaeld_lt, 0)
+        + COALESCE(gaeld_tilknyttede_lt, 0) + COALESCE(gaeld_tilknyttede_st, 0)
+    END                                                                      AS rentebaerende_gaeld,
+
+    -- Total capital deployed: what the owners have put at work — equity plus
+    -- related-party / shareholder loans. Denominator of ROTCD.
+    egenkapital + COALESCE(gaeld_tilknyttede_lt, 0) + COALESCE(gaeld_tilknyttede_st, 0)
+                                                                             AS total_capital_deployed,
+
+    -- Invested capital (financing side): equity + all interest-bearing debt.
+    -- Cash is not netted: at a trading firm it is margin and collateral.
+    egenkapital + COALESCE(bankgaeld_st, 0) + COALESCE(bankgaeld_lt, 0)
+        + COALESCE(gaeld_tilknyttede_lt, 0) + COALESCE(gaeld_tilknyttede_st, 0)
+                                                                             AS investeret_kapital,
+
+    -- Net working capital: current assets - current liabilities.
+    omloebsaktiver - kortfristet_gaeld                                       AS arbejdskapital,
+
+    -- Operating working capital: the same without the financing items —
+    -- cash and securities out of current assets, short-term bank and
+    -- related-party debt out of current liabilities.
+    (omloebsaktiver - COALESCE(kassebeholdning, 0) - COALESCE(vaerdipapirer, 0))
+    - (kortfristet_gaeld - COALESCE(bankgaeld_st, 0) - COALESCE(gaeld_tilknyttede_st, 0))
+                                                                             AS driftsarbejdskapital,
 
     -- Current ratio
     CASE WHEN kortfristet_gaeld > 0 AND omloebsaktiver IS NOT NULL
@@ -1360,10 +1669,21 @@ FROM base;
 """
 
 
+#: Balance-sheet detail columns added after the original schema (ALTER TABLE).
+_BALANCE_DETAIL_COLS = (
+    "anlaegsaktiver", "gaeld_i_alt", "hensatte_forpligtelser", "tilgodehavender",
+    "tilgodehavender_tilknyttede", "varebeholdninger", "vaerdipapirer",
+    "leverandoergaeld", "bankgaeld_st", "bankgaeld_lt",
+    "derivater_aktiver", "derivater_passiver",
+    "gaeld_tilknyttede_primo", "bankgaeld_primo",
+)
+
+
 def store(
     company_rows: list[dict],
     financial_rows: list[dict],
     employee_monthly_rows: list[dict] | None = None,
+    fact_rows: list[dict] | None = None,
 ) -> None:
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
     con = duckdb.connect(str(DB_PATH))
@@ -1403,7 +1723,8 @@ def store(
         con.execute("ALTER TABLE financials ADD COLUMN bruttoresultat DOUBLE")
     for _col in ("vareforbrug", "afskrivninger", "fin_indt", "fin_udg", "skat", "udbytte",
                  "gaeld_tilknyttede_lt", "gaeld_tilknyttede_st",
-                 "ebt", "kassebeholdning", "omloebsaktiver"):
+                 "ebt", "kassebeholdning", "omloebsaktiver",
+                 *_BALANCE_DETAIL_COLS):
         if _col not in fin_cols:
             con.execute(f"ALTER TABLE financials ADD COLUMN {_col} DOUBLE")
 
@@ -1441,6 +1762,20 @@ def store(
         df_em = pd.DataFrame(employee_monthly_rows)  # referenced by name in SQL below
         con.execute("DELETE FROM employee_monthly WHERE cvr IN (SELECT DISTINCT cvr FROM df_em)")
         con.execute("INSERT INTO employee_monthly SELECT * FROM df_em")
+
+    if fact_rows:
+        df_x = pd.DataFrame(fact_rows)  # referenced by name in SQL below
+        for col in ("regnskab_slut", "period_end"):
+            df_x[col] = pd.to_datetime(df_x[col], errors="coerce").dt.date
+        # Replace the facts of each filing that was re-parsed, nothing else.
+        con.execute(
+            "DELETE FROM xbrl_facts WHERE (cvr, regnskab_slut) IN "
+            "(SELECT DISTINCT cvr, regnskab_slut FROM df_x)"
+        )
+        con.execute(
+            "INSERT INTO xbrl_facts (cvr, regnskab_slut, concept, period_end, value) "
+            "SELECT cvr, regnskab_slut, concept, period_end, value FROM df_x"
+        )
 
     # Apply manual patches for filings where XBRL is incomplete
     for (patch_cvr, patch_date), fields in MANUAL_PATCHES.items():
@@ -1594,6 +1929,7 @@ def main() -> None:
                 pass
 
         financial_rows: list[dict] = []
+        fact_rows: list[dict] = []
         for i, crow in enumerate(company_rows, 1):
             cvr = crow["cvr"]
             if not cvr:
@@ -1601,9 +1937,11 @@ def main() -> None:
             periods = known_periods.get(cvr, set())
             tag = f" [{len(periods)} periods cached]" if periods else ""
             print(f"  [{i}/{len(company_rows)}] {crow['navn']} (CVR {cvr}){tag}", flush=True)
-            financial_rows.extend(fetch_and_parse_financials(cvr, skip_periods=periods))
+            financial_rows.extend(
+                fetch_and_parse_financials(cvr, skip_periods=periods, facts_out=fact_rows)
+            )
 
-        store(company_rows, financial_rows, employee_monthly_rows)
+        store(company_rows, financial_rows, employee_monthly_rows, fact_rows)
         check_watchlist()
 
     if args.export or run_all:

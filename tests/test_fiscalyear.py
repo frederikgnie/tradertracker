@@ -7,6 +7,7 @@ transition period a company files when it moves its year-end.
 
 from datetime import date
 
+import pandas as pd
 import pytest
 
 from tradertracker.fiscalyear import (
@@ -185,3 +186,11 @@ class TestToDate:
     def test_rejects_garbage(self):
         assert to_date("not-a-date") is None
         assert to_date(None) is None
+
+    def test_missing_pandas_values_are_none(self):
+        """NaT is a datetime subclass and used to raise on comparison."""
+        assert to_date(pd.NaT) is None
+        assert to_date(float("nan")) is None
+        assert fiscal_year(pd.NaT, "2024-06-30") == 2023
+        assert fiscal_year("2024-01-01", pd.NaT) is None
+        assert annualisation_factor(pd.NaT, "2024-06-30") == 1.0
