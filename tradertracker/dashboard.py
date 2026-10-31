@@ -148,12 +148,32 @@ METRICS: dict[str, dict] = {
     "ROIC (%)": {
         "col": "roic_pct",
         "fmt": ".1f",
-        "help": "Return on Invested Capital = NOPAT / opening invested capital. NOPAT = EBIT × (1 − effective tax rate, 22% when it cannot be derived), so it is independent of how the firm is funded. Invested capital = equity + long-term liabilities + short-term related-party loans; filings do not separate bank debt from other liabilities, so this is a proxy. Cash is not netted off, because at a trading firm it is margin collateral (working capital). Use alongside ROTCD: ROTCD is the owners' return, ROIC the return on all long-term funding.",
+        "help": "Return on Invested Capital = NOPAT / opening invested capital. NOPAT = EBIT × (1 − effective tax rate, 22% when it cannot be derived), so it is independent of how the firm is funded. Invested capital = equity + interest-bearing debt (banks, credit institutions, mortgages, IFRS 16 leases and related-party loans), each parsed from its own balance-sheet line. Cash is not netted off, because at a trading firm it is margin collateral (working capital). Use alongside ROTCD: ROTCD is the owners' return, ROIC the return on all funding.",
     },
     "Total Capital Deployed (DKK)": {
         "col": "total_capital_deployed",
         "fmt": ",.0f",
-        "help": "Closing equity + related-party loans (gæld til tilknyttede virksomheder). Captures the full capital the owner has committed to the business, regardless of whether it is structured as formal equity or intercompany debt.",
+        "help": "Closing equity + related-party loans (gæld til tilknyttede virksomheder / kapitalejere). Captures the full capital the owner has committed to the business, regardless of whether it is structured as formal equity or intercompany debt.",
+    },
+    "Invested Capital (DKK)": {
+        "col": "investeret_kapital",
+        "fmt": ",.0f",
+        "help": "Closing equity + all interest-bearing debt: banks, credit institutions, mortgages, IFRS 16 lease liabilities and related-party loans. Total capital deployed plus external borrowing. Cash is not netted off (margin collateral at a trading firm). Denominator of ROIC.",
+    },
+    "Interest-bearing Debt (DKK)": {
+        "col": "rentebaerende_gaeld",
+        "fmt": ",.0f",
+        "help": "Bank and credit-institution debt, mortgages, IFRS 16 lease liabilities and related-party loans, short- and long-term.",
+    },
+    "Working Capital (DKK)": {
+        "col": "arbejdskapital",
+        "fmt": ",.0f",
+        "help": "Net working capital = current assets − current liabilities (omsætningsaktiver − kortfristet gæld).",
+    },
+    "Operating Working Capital (DKK)": {
+        "col": "driftsarbejdskapital",
+        "fmt": ",.0f",
+        "help": "Working capital without the financing items: current assets less cash and securities, minus current liabilities less short-term bank and related-party debt. What the trading book itself ties up (receivables, collateral, derivatives net of payables).",
     },
     "TRADE (%)": {
         "col": "trade_pct",
@@ -175,7 +195,7 @@ METRICS: dict[str, dict] = {
 # Grouped order for dropdowns — entries starting with "──" are visual separators
 _METRIC_ORDER = [
     "── Returns ──",
-    "ROE (%)", "ROOE (%)", "ROTCD (%)", "TRADE (%)", "ROCE (%)", "ROA (%)",
+    "ROE (%)", "ROOE (%)", "ROTCD (%)", "ROIC (%)", "TRADE (%)", "ROCE (%)", "ROA (%)",
     "── Absolute ──",
     "Net Profit (DKK)", "EBIT (DKK)", "Revenue (DKK)", "Opening Equity (DKK)", "Equity (DKK)", "Total Capital Deployed (DKK)",
     "── Margins ──",
@@ -183,6 +203,8 @@ _METRIC_ORDER = [
     "── Per Employee ──",
     "Profit / Employee (tDKK)", "Revenue / Employee (tDKK)", "Equity / Employee (tDKK)",
     "── Capital Structure ──",
+    "Invested Capital (DKK)", "Interest-bearing Debt (DKK)",
+    "Working Capital (DKK)", "Operating Working Capital (DKK)",
     "Equity Ratio (%)", "Debt Ratio (%)", "Asset Turnover",
     "── Salary ──",
     "Personnel Costs (DKK)", "Salary / Employee (tDKK)",
@@ -351,40 +373,60 @@ def load_data() -> pd.DataFrame:
     df["rooe_pct"] = (df["aarsresultat"] / opening_equity * 100).round(2)
 
     # Opening related-party loans — used by both ROTCD and TRADE below.
-    opening_related = df.groupby("cvr")["gaeld_tilknyttede"].shift(1).fillna(0)
+    # Prefer the filing's own comparative column (gaeld_tilknyttede_primo),
+    # then the prior row's closing loans. A genuine first year takes its
+    # closing loans — the loans injected during the year — exactly as it
+    # takes closing equity minus profit for equity; it used to take 0, so a
+    # first-year firm with >= 1M equity had its owner loans ignored while
+    # one with less had them counted.
+    _first_year = prior_equity_shift.isna() & df["egenkapital_primo"].isna()
+    opening_related = (
+        df["gaeld_tilknyttede_primo"]
+        .fillna(df.groupby("cvr")["gaeld_tilknyttede"].shift(1))
+        .fillna(df["gaeld_tilknyttede"].where(_first_year))
+        .fillna(0)
+    )
 
     # ROTCD: same as ROOE but denominator includes opening related-party loans.
-    # For first-year companies where opening_equity is NaN due to thin equity capitalisation
-    # (e.g. ApS funded via shareholder loans), falls back to closing (equity - profit + loans)
-    # as the opening capital proxy, bypassing the 1M equity-only guard.
-    opening_total_normal = opening_equity + opening_related
-    first_year_total = (df["egenkapital"] - df["aarsresultat"] + df["gaeld_tilknyttede"]).where(
-        opening_total_normal.isna()
-        & ((df["egenkapital"] - df["aarsresultat"] + df["gaeld_tilknyttede"]) >= 1e6)
+    # The 1M floor applies to the total, not to equity alone: a thinly
+    # capitalised ApS funded by shareholder loans has a real opening capital
+    # even when its equity is tiny. (It used to need >= 1M equity, else fell
+    # back to closing figures in every year, not only the first.)
+    _raw_opening_equity = (
+        df["egenkapital_primo"]
+        .fillna(prior_equity_shift)
+        .fillna((df["egenkapital"] - df["aarsresultat"]).where(_first_year))
     )
-    opening_total_capital = opening_total_normal.fillna(first_year_total)
-    df["rotcd_pct"] = (df["aarsresultat"] / opening_total_capital.where(opening_total_capital >= 1e6) * 100).round(2)
-    df["total_capital_deployed"] = df["egenkapital"] + df["gaeld_tilknyttede"]
+    opening_total_capital = (_raw_opening_equity + opening_related).where(
+        lambda s: s >= 1e6
+    )
+    df["rotcd_pct"] = (df["aarsresultat"] / opening_total_capital * 100).round(2)
 
-    # ROIC: NOPAT / opening invested capital. Filings do not split
-    # interest-bearing debt from other liabilities, so invested capital is
-    # equity + long-term liabilities + short-term related-party loans (the
-    # long-term related-party part already sits inside long-term liabilities).
+    # ROIC: NOPAT / opening invested capital. Invested capital comes from the
+    # kpis view: equity + interest-bearing debt (banks, credit institutions,
+    # mortgages, IFRS 16 leases, related-party loans), parsed line by line.
     # Cash is deliberately not netted off: at a trading firm it is margin and
     # collateral, i.e. working capital, and netting it leaves about a quarter
     # of the firms with zero or negative capital.
-    _lt = df[["langfristet_gaeld", "gaeld_tilknyttede_lt"]].fillna(0).max(axis=1)
-    _invested = df["egenkapital"] + _lt + df["gaeld_tilknyttede_st"].fillna(0)
+    _invested = df["investeret_kapital"]
     _tax_rate = (
         (df["skat"] / df["ebt"]).where((df["ebt"] > 0) & (df["skat"] >= 0))
         .clip(0, 0.4).fillna(0.22)  # 22% = Danish corporate tax rate
     )
     _nopat = df["ebit"] * (1 - _tax_rate)
+    # Opening invested capital: the filing's comparative column first (equity,
+    # bank debt and related-party loans at the previous year-end), then the
+    # prior row, then for a genuine first year the capital before this
+    # year's profit.
+    # An untagged debt line is zero (the view's rule too), so a missing debt
+    # primo — a row parsed before those columns existed, or a manual patch —
+    # must not blank out a known opening equity.
     _opening_invested = (
-        _invested.groupby(df["cvr"]).shift(1)
-        .fillna(_invested - df["aarsresultat"])  # first year: capital before this year's profit
+        (df["egenkapital_primo"] + df["bankgaeld_primo"].fillna(0)
+         + df["gaeld_tilknyttede_primo"].fillna(0))
+        .fillna(_invested.groupby(df["cvr"]).shift(1))
+        .fillna((_invested - df["aarsresultat"]).where(_first_year))
     )
-    df["invested_capital"] = _invested
     df["roic_pct"] = (_nopat / _opening_invested.where(_opening_invested >= 1e6) * 100).round(2)
 
     # TRADE: Gross Trading Profit / (Headcount × Opening Equity) × 100
@@ -397,9 +439,9 @@ def load_data() -> pd.DataFrame:
     # Deployed capital = opening equity + opening related-party loans.
     # Related-party loans (gæld til tilknyttede virksomheder) are often how owners fund
     # trading operations instead of formal equity — economically equivalent, so both count.
-    deployed_capital = opening_equity + opening_related
-    # Suppress TRADE when deployed capital is near-zero — ratio is undefined for dormant firms.
-    valid_deployed = deployed_capital.where(deployed_capital >= 1e6)
+    # Same opening capital as ROTCD, already suppressed below 1M (undefined
+    # for dormant firms).
+    valid_deployed = opening_total_capital
     df["trade_pct"] = (gross_trading_profit / (headcount * valid_deployed) * 100).round(2)
 
     # Ratios of a flow to a stock or to headcount describe one year of
@@ -676,6 +718,8 @@ _DKK_ABS_COLS = [
     "omsaetning", "bruttoresultat", "ebit", "aarsresultat",
     "egenkapital", "egenkapital_primo", "aktiver",
     "kortfristet_gaeld", "langfristet_gaeld", "personaleomkostninger",
+    "total_capital_deployed", "investeret_kapital", "rentebaerende_gaeld",
+    "arbejdskapital", "driftsarbejdskapital",
 ]
 # Per-employee columns are already in tDKK — convert label only
 _DKK_PER_EMP_COLS = [
@@ -878,6 +922,10 @@ with tab_rankings:
 
 # ─── Tab: Time Series ─────────────────────────────────────────────────────────
 
+# Flow amounts that accumulate over the period and can be annualised.
+# Balance-sheet items (equity, capital) and headcount are point-in-time.
+_TS_FLOW_COLS = {"omsaetning", "aarsresultat", "ebit", "personaleomkostninger"}
+
 with tab_timeseries:
     intraday_names = sorted(df_all[df_all["is_intraday"] == True]["navn"].unique())
     all_names = sorted(df_ts["navn"].unique())
@@ -913,6 +961,17 @@ with tab_timeseries:
 
     st.info(f"**{ts_metric_display}** — {ts_meta['help']}")
 
+    # Amounts are plotted as filed, so an 18-month first period shows 18
+    # months of profit. Ratios are always annualised; flows only on request.
+    ts_annualise = ts_col in _TS_FLOW_COLS and st.checkbox(
+        "Annualise stub and long periods",
+        value=False,
+        help="Scale amounts from periods that are not ~12 months to a yearly "
+             "basis (× 365 / days), so a 6-month stub or an 18-month first year "
+             "is comparable to a normal year. Normal years are untouched.",
+        key="ts_annualise",
+    )
+
     _ts_min_year = int(df_ts["year"].min()) if not df_ts.empty else 2017
     _ts_max_year = int(df_ts["year"].max()) if not df_ts.empty else 2025
     ts_year_range = st.slider("Year range", _ts_min_year, _ts_max_year,
@@ -929,6 +988,14 @@ with tab_timeseries:
             ]
             .dropna(subset=[ts_col, "year"])
         )
+        if ts_annualise:
+            _factor = pd.Series(
+                [fy.annualisation_factor(a, b)
+                 for a, b in zip(df_plot["fy_start"], df_plot["regnskab_slut"])],
+                index=df_plot.index,
+                dtype="float64",
+            ).fillna(1.0)
+            df_plot = df_plot.assign(**{ts_col: df_plot[ts_col] * _factor})
         if df_plot.empty:
             st.warning("No data for the selected companies and metric.")
         else:

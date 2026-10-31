@@ -42,6 +42,7 @@ Dates are treated as inclusive on both ends, matching Danish XBRL
 
 from __future__ import annotations
 
+import math
 from datetime import date, datetime, timedelta
 
 __all__ = [
@@ -78,7 +79,11 @@ def to_date(value: object) -> date | None:
     Returns ``None`` for anything null or unparseable, so callers can treat a
     missing period the same way they treat a missing figure.
     """
-    if value is None:
+    # pandas NaT is a datetime subclass whose comparisons raise, so it must be
+    # caught before the isinstance checks (by type name: no pandas import here).
+    if value is None or type(value).__name__ == "NaTType":
+        return None
+    if isinstance(value, float) and math.isnan(value):
         return None
     if isinstance(value, datetime):
         return value.date()
